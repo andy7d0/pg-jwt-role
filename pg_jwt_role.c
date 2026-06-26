@@ -47,10 +47,16 @@
  * (Step 3) temporarily elevates to superuser via SetUserIdAndSecContext()
  * before calling set_config_option().
  *
- * Steps still pending in this file:
- *   - Step 3 - replace the placeholder body of pg_jwt_verify_and_set_role
- *     with the full atomic implementation (verify + JSON parse + role
- *     switch + GUC writes through the slot pool).
+ * Step 3 (atomic C function): pg_jwt_verify_and_set_role now performs
+ * the full verify + JSON-parse + exp check + SetCurrentRoleId +
+ * set_config_option sequence after a successful OpenSSL signature
+ * check. See pg_jwt_verify() for the algorithm dispatch (HS/RS/ES families)
+ * and pg_json_extract_value() for the payload scanner. All output
+ * GUCs (pg_jwt_role.role and the claim_<N> slot pool) are written
+ * with privilege elevation around set_config_option() to bypass
+ * PGC_SUSET for the caller.
+ *
+ * Step still pending in this file:
  *   - Step 4 - install the ProcessUtility_hook and its helper.
  */
 
@@ -64,11 +70,26 @@
 #include "limits.h"
 #include "string.h"
 
+#include "miscadmin.h"     /* GetUserIdAndSecContext, SetUserIdAndSecContext,
+                                   * BOOTSTRAP_SUPERUSERID, SECURITY_SUPERUSER */
+#include "commands/user.h" /* SetCurrentRoleId, GetCurrentRoleId */
+#include "utils/acl.h"     /* get_role_oid */
+
+#include <openssl/hmac.h>   /* HMAC */
+#include <openssl/evp.h>    /* EVP_sha*, EVP_DigestVerify*, EVP_PKEY */
+#include <openssl/pem.h>    /* PEM_read_bio_PUBKEY */
+#include <openssl/bio.h>    /* BIO_new_mem_buf */
+#include <openssl/crypto.h> /* CRYPTO_memcmp */
+
+#include <stdio.h>  /* snprintf */
+#include <stdlib.h> /* strtoll, atoi */
+#include <time.h>   /* time, time_t */
+
 PG_MODULE_MAGIC;
 
 /* Internal helpers used by the C entry points. Defined further down. */
-extern int  pg_jwt_claim_slot(const char *name);
-extern int  pg_jwt_claim_slot_lookup(const char *name);
+extern int pg_jwt_claim_slot(const char *name);
+extern int pg_jwt_claim_slot_lookup(const char *name);
 extern bool pg_jwt_claim_slot_guc_name(int slot, char *buf, int buflen);
 
 /*
@@ -85,6 +106,19 @@ extern bool pg_jwt_claim_slot_guc_name(int slot, char *buf, int buflen);
  * sizeof claim slot GUC name buffer (PG_JWT_MAX_CLAIM_NAME_LEN + 32).
  */
 #define PG_JWT_MAX_CLAIM_NAME_LEN 64
+
+/*
+ * Stack-buffer size constants for the atomic C function
+ * pg_jwt_verify_and_set_role (Step 3). Matches plans/plan.md §8.
+ *
+ * Hard rule: no palloc, no malloc. Every byte the C function
+ * touches must fit in one of these fixed-size stack buffers.
+ */
+#define PG_JWT_MAX_ALG_LEN 16
+#define PG_JWT_MAX_SIG_BYTES 512
+#define PG_JWT_MAX_KEY_LEN 4096
+#define PG_JWT_MAX_PAYLOAD_LEN 1024
+#define PG_JWT_MAX_CLAIM_VAL_LEN 256
 
 /*
  * Per-backend slot binding table. claim_slot_name[i] holds the
@@ -130,25 +164,610 @@ static char *cfg_restricted_session_users = cfg_restricted_session_users_buf;
 static char *cfg_role = cfg_role_buf;
 
 /*
+ * pg_base64_decode - decode a standard base64 string (NOT base64url)
+ * into a byte buffer. Returns the number of bytes written, or -1 on
+ * malformed input or buffer overflow.
+ *
+ * Accepts the alphabet A-Z a-z 0-9 + /, '=' padding, and embedded
+ * whitespace (space, tab, CR, LF). The input is NOT NUL-terminated;
+ * srclen is the exact length. The caller must normalise base64url ->
+ * standard base64 ('-' -> '+', '_' -> '/') before calling.
+ */
+static int
+pg_base64_decode(const char *src, int srclen, char *dst, int dstlen)
+{
+    int quad[4];
+    int qi = 0;
+    int out = 0;
+    int i;
+
+    for (i = 0; i < srclen; i++)
+    {
+        char c = src[i];
+        int v;
+
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r')
+            continue;
+        if (c == '=')
+            break;
+        if (c >= 'A' && c <= 'Z')
+            v = c - 'A';
+        else if (c >= 'a' && c <= 'z')
+            v = c - 'a' + 26;
+        else if (c >= '0' && c <= '9')
+            v = c - '0' + 52;
+        else if (c == '+')
+            v = 62;
+        else if (c == '/')
+            v = 63;
+        else
+            return -1;
+        quad[qi++] = v;
+        if (qi == 4)
+        {
+            if (out + 3 > dstlen)
+                return -1;
+            dst[out++] = (char)((quad[0] << 2) | (quad[1] >> 4));
+            dst[out++] = (char)((quad[1] << 4) | (quad[2] >> 2));
+            dst[out++] = (char)((quad[2] << 6) | quad[3]);
+            qi = 0;
+        }
+    }
+    if (qi == 1)
+        return -1;
+    if (qi == 2)
+    {
+        if (out + 1 > dstlen)
+            return -1;
+        dst[out++] = (char)((quad[0] << 2) | (quad[1] >> 4));
+    }
+    else if (qi == 3)
+    {
+        if (out + 2 > dstlen)
+            return -1;
+        dst[out++] = (char)((quad[0] << 2) | (quad[1] >> 4));
+        dst[out++] = (char)((quad[1] << 4) | (quad[2] >> 2));
+    }
+    return out;
+}
+
+/*
+ * pg_json_extract_value - look up a key in a flat JSON object and
+ * copy its scalar value into `out`. Returns true on success, false if
+ * the key is not present.
+ *
+ * Deliberately tiny: searches for `"<key>":` with strstr, then
+ * extracts either a quoted string (with simple \\, \" escape handling)
+ * or a bare numeric/bool/null literal terminated by ',', '}', or
+ * whitespace. NOT a full JSON parser. See plans/plan.md §8.
+ */
+static bool
+pg_json_extract_value(const char *json, const char *key,
+                      char *out, int outlen)
+{
+    char pattern[PG_JWT_MAX_CLAIM_NAME_LEN + 8];
+    int key_len;
+    int pattern_len;
+    const char *p;
+    int i;
+
+    if (json == NULL || key == NULL || out == NULL || outlen < 2)
+        return false;
+
+    key_len = (int)strlen(key);
+    if (key_len <= 0 || key_len >= PG_JWT_MAX_CLAIM_NAME_LEN)
+        return false;
+    if (key_len + 4 > (int)sizeof(pattern))
+        return false;
+
+    pattern[0] = '"';
+    memcpy(pattern + 1, key, key_len);
+    pattern[1 + key_len] = '"';
+    pattern[2 + key_len] = ':';
+    pattern_len = 3 + key_len;
+    pattern[pattern_len] = '\0';
+
+    p = strstr(json, pattern);
+    if (p == NULL)
+        return false;
+    p += pattern_len;
+
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')
+        p++;
+
+    if (*p == '"')
+    {
+        p++;
+        i = 0;
+        while (*p && *p != '"')
+        {
+            if (*p == '\\' && *(p + 1))
+            {
+                p++;
+                if (i < outlen - 1)
+                    out[i++] = *p;
+                p++;
+            }
+            else
+            {
+                if (i < outlen - 1)
+                    out[i++] = *p;
+                p++;
+            }
+        }
+        out[i] = '\0';
+        return (i > 0);
+    }
+
+    {
+        const char *start = p;
+        while (*p && *p != ',' && *p != '}' &&
+               *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r')
+            p++;
+        i = (int)(p - start);
+        if (i >= outlen)
+            i = outlen - 1;
+        memcpy(out, start, i);
+        out[i] = '\0';
+        return (i > 0);
+    }
+}
+
+/*
+ * pg_split_csv - copy the comma-separated names from `csv` into
+ * `names`, one per row. Returns the count copied (>= 0), truncated to
+ * `max`. Names are trimmed of leading/trailing ASCII whitespace;
+ * empty entries are skipped.
+ */
+static int
+pg_split_csv(const char *csv,
+             char names[][PG_JWT_MAX_CLAIM_NAME_LEN], int max)
+{
+    int n = 0;
+    const char *p;
+
+    if (csv == NULL || max <= 0)
+        return 0;
+
+    p = csv;
+    while (*p && n < max)
+    {
+        const char *start;
+        const char *end;
+        int len;
+
+        while (*p == ' ' || *p == '\t')
+            p++;
+        start = p;
+        while (*p && *p != ',')
+            p++;
+        end = p;
+        while (end > start && (end[-1] == ' ' || end[-1] == '\t'))
+            end--;
+
+        len = (int)(end - start);
+        if (len > 0)
+        {
+            if (len >= PG_JWT_MAX_CLAIM_NAME_LEN)
+                len = PG_JWT_MAX_CLAIM_NAME_LEN - 1;
+            memcpy(names[n], start, len);
+            names[n][len] = '\0';
+            n++;
+        }
+
+        if (*p == ',')
+            p++;
+    }
+    return n;
+}
+
+/*
+ * pg_jwt_verify - dispatch signature verification based on `alg`.
+ *
+ *   HS256/384/512 : HMAC-SHA-2 over signing_input with `key` as the
+ *                   secret. Verification is constant-time via
+ *                   CRYPTO_memcmp().
+ *   RS256/384/512 : EVP_DigestVerify* with a PEM-encoded RSA public
+ *                   key from `key`.
+ *   ES256/384/512 : EVP_DigestVerify* with a PEM-encoded EC public
+ *                   key from `key`.
+ *
+ * Returns true iff the signature is cryptographically valid. Any
+ * failure (unknown alg, malformed PEM, length mismatch, OpenSSL
+ * error) collapses to false. The caller turns that into an ereport.
+ */
+static bool
+pg_jwt_verify(const char *alg,
+              const char *signing_input, int signing_input_len,
+              const char *signature, int signature_len,
+              const char *key, int key_len)
+{
+    const EVP_MD *md = NULL;
+    bool is_hmac = false;
+    bool is_asym = false;
+    unsigned char mac[EVP_MAX_MD_SIZE];
+    unsigned int mac_len = 0;
+    int cmp;
+
+    if (alg == NULL || alg[0] == '\0')
+        return false;
+
+    if (strcmp(alg, "HS256") == 0)
+    {
+        md = EVP_sha256();
+        is_hmac = true;
+    }
+    else if (strcmp(alg, "HS384") == 0)
+    {
+        md = EVP_sha384();
+        is_hmac = true;
+    }
+    else if (strcmp(alg, "HS512") == 0)
+    {
+        md = EVP_sha512();
+        is_hmac = true;
+    }
+    else if (strcmp(alg, "RS256") == 0)
+    {
+        md = EVP_sha256();
+        is_asym = true;
+    }
+    else if (strcmp(alg, "RS384") == 0)
+    {
+        md = EVP_sha384();
+        is_asym = true;
+    }
+    else if (strcmp(alg, "RS512") == 0)
+    {
+        md = EVP_sha512();
+        is_asym = true;
+    }
+    else if (strcmp(alg, "ES256") == 0)
+    {
+        md = EVP_sha256();
+        is_asym = true;
+    }
+    else if (strcmp(alg, "ES384") == 0)
+    {
+        md = EVP_sha384();
+        is_asym = true;
+    }
+    else if (strcmp(alg, "ES512") == 0)
+    {
+        md = EVP_sha512();
+        is_asym = true;
+    }
+    else
+        return false;
+
+    if (md == NULL)
+        return false;
+
+    if (is_hmac)
+    {
+        if (key_len <= 0)
+            return false;
+
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+        if (HMAC(md, key, key_len,
+                 (const unsigned char *)signing_input,
+                 (size_t)signing_input_len,
+                 mac, &mac_len) == NULL)
+            return false;
+#pragma GCC diagnostic pop
+
+        if (mac_len != (unsigned int)signature_len)
+            return false;
+        cmp = CRYPTO_memcmp(mac, signature, mac_len);
+        return (cmp == 0);
+    }
+
+    if (is_asym)
+    {
+        EVP_PKEY *pkey = NULL;
+        EVP_MD_CTX *ctx = NULL;
+        BIO *bio = NULL;
+        bool ok = false;
+
+        if (signature_len <= 0 || key_len <= 0)
+            return false;
+
+        bio = BIO_new_mem_buf((void *)key, key_len);
+        if (bio == NULL)
+            goto out;
+
+        pkey = PEM_read_bio_PUBKEY(bio, NULL, NULL, NULL);
+        if (pkey == NULL)
+            goto out;
+
+        ctx = EVP_MD_CTX_new();
+        if (ctx == NULL)
+            goto out;
+
+        if (EVP_DigestVerifyInit(ctx, NULL, md, NULL, pkey) != 1)
+            goto out;
+        if (EVP_DigestVerifyUpdate(ctx,
+                                   signing_input,
+                                   (size_t)signing_input_len) != 1)
+            goto out;
+        if (EVP_DigestVerifyFinal(ctx,
+                                  (const unsigned char *)signature,
+                                  (size_t)signature_len) != 1)
+            goto out;
+
+        ok = true;
+    out:
+        if (ctx != NULL)
+            EVP_MD_CTX_free(ctx);
+        if (pkey != NULL)
+            EVP_PKEY_free(pkey);
+        if (bio != NULL)
+            BIO_free(bio);
+        return ok;
+    }
+
+    return false;
+}
+
+/*
  * verify_and_set_role(alg, signing_input, signature_b64, payload_decoded)
  *   -> text
  *
  * Atomic single-call entry point. NEVER call SetCurrentRoleId without
  * first verifying the JWT signature inside this function.
  *
- * Step 2 stub: always errors out. Step 3 replaces this body with the
- * full atomic implementation (HMAC/EVP_DigestVerify, JSON scan, exp
- * check, SetCurrentRoleId, set_config_option through the slot pool).
+ * Step 3 implementation:
+ *   1. Pull alg / signing_input / sig_b64 / payload off PG_FUNCTION_ARGS.
+ *   2. Read verify_key, role_claim, extra_claims, max_jwt_len,
+ *      max_claim_len GUCs (applying documented defaults when empty).
+ *   3. Decode signature_b64 (base64url) into a stack buffer.
+ *   4. pg_jwt_verify() - OpenSSL verify with constant-time compare.
+ *      On FAIL -> ereport(ERROR), NO side effects.
+ *   5. Copy payload into a NUL-terminated stack buffer for scanning.
+ *   6. Check "exp" claim vs time(NULL).
+ *   7. Extract role_claim value, resolve role_oid via get_role_oid().
+ *   8. Parse extra_claims CSV, extract each claim value from payload.
+ *   9. SetCurrentRoleId(role_oid)  -- ROLE SWITCH
+ *  10. Elevate to superuser, write pg_jwt_role.role GUC + each claim
+ *      slot GUC via set_config_option(GUC_ACTION_LOCAL).
+ *  11. Restore original security context.
+ *  12. Return role_name text.
  */
 PG_FUNCTION_INFO_V1(pg_jwt_verify_and_set_role);
 
 Datum pg_jwt_verify_and_set_role(PG_FUNCTION_ARGS)
 {
-    ereport(ERROR,
-            (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-             errmsg("pg_jwt_role: verify_and_set_role is not yet implemented "
-                    "(see Step 3 of plans/plan.md)")));
-    PG_RETURN_NULL();
+    text *alg_arg;
+    bytea *signing_input_arg;
+    text *sig_b64_arg;
+    bytea *payload_arg;
+    char alg_buf[PG_JWT_MAX_ALG_LEN];
+    int alg_len;
+    char sig_b64[PG_JWT_MAX_SIG_BYTES + 4];
+    int sig_b64_len;
+    int signing_input_len;
+    const char *signing_input_ptr;
+    int payload_len;
+    const char *payload_ptr;
+
+    const char *verify_key;
+    int verify_key_len;
+
+    char role_claim[PG_JWT_MAX_CLAIM_NAME_LEN];
+    char extra_claims[256];
+    int max_jwt_len;
+    int max_claim_len;
+
+    char sig_bytes[PG_JWT_MAX_SIG_BYTES];
+    int sig_bytes_len;
+
+    char payload_buf[PG_JWT_MAX_PAYLOAD_LEN + 1];
+
+    char exp_str[64];
+    time_t exp_val;
+    time_t now;
+
+    char role_name[PG_JWT_MAX_CLAIM_NAME_LEN];
+    Oid role_oid;
+
+    char claim_names[PG_JWT_MAX_CLAIMS][PG_JWT_MAX_CLAIM_NAME_LEN];
+    char claim_vals[PG_JWT_MAX_CLAIMS][PG_JWT_MAX_CLAIM_VAL_LEN];
+    int n_extra;
+    int i;
+
+    int save_userid;
+    int save_sec;
+    char slot_guc[64];
+
+    /* ----- 1. Pull arguments. STRICT means non-NULL, but be defensive. */
+    if (PG_ARGISNULL(0) || PG_ARGISNULL(1) ||
+        PG_ARGISNULL(2) || PG_ARGISNULL(3))
+        ereport(ERROR,
+                (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+                 errmsg("pg_jwt_role: verify_and_set_role arguments must not be NULL")));
+
+    alg_arg = PG_GETARG_TEXT_PP(0);
+    signing_input_arg = PG_GETARG_BYTEA_PP(1);
+    sig_b64_arg = PG_GETARG_TEXT_PP(2);
+    payload_arg = PG_GETARG_BYTEA_PP(3);
+
+    alg_len = VARSIZE_ANY_EXHDR(alg_arg);
+    if (alg_len <= 0 || alg_len >= PG_JWT_MAX_ALG_LEN)
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                 errmsg("pg_jwt_role: invalid alg length")));
+    memcpy(alg_buf, VARDATA_ANY(alg_arg), alg_len);
+    alg_buf[alg_len] = '\0';
+
+    signing_input_len = VARSIZE_ANY_EXHDR(signing_input_arg);
+    signing_input_ptr = VARDATA_ANY(signing_input_arg);
+
+    sig_b64_len = VARSIZE_ANY_EXHDR(sig_b64_arg);
+    if (sig_b64_len < 0 || sig_b64_len >= (int)sizeof(sig_b64))
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                 errmsg("pg_jwt_role: signature_b64 too long")));
+    memcpy(sig_b64, VARDATA_ANY(sig_b64_arg), sig_b64_len);
+    sig_b64[sig_b64_len] = '\0';
+
+    payload_len = VARSIZE_ANY_EXHDR(payload_arg);
+    payload_ptr = VARDATA_ANY(payload_arg);
+    if (payload_len < 0 || payload_len > PG_JWT_MAX_PAYLOAD_LEN)
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                 errmsg("pg_jwt_role: payload too large")));
+
+    /* ----- 2. Read configuration GUCs. */
+    verify_key = GetConfigOptionByName("pg_jwt_role.verify_key", NULL, false);
+    if (verify_key == NULL || verify_key[0] == '\0')
+        ereport(ERROR,
+                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                 errmsg("pg_jwt_role: pg_jwt_role.verify_key is not set")));
+    verify_key_len = (int)strlen(verify_key);
+    if (verify_key_len >= PG_JWT_MAX_KEY_LEN)
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                 errmsg("pg_jwt_role: verify_key too long")));
+
+    {
+        const char *rc_raw = GetConfigOptionByName("pg_jwt_role.role_claim", NULL, false);
+        const char *src = (rc_raw != NULL && rc_raw[0] != '\0') ? rc_raw : "role";
+        strncpy(role_claim, src, sizeof(role_claim) - 1);
+        role_claim[sizeof(role_claim) - 1] = '\0';
+    }
+    {
+        const char *ec_raw = GetConfigOptionByName("pg_jwt_role.extra_claims", NULL, false);
+        const char *src = (ec_raw != NULL && ec_raw[0] != '\0') ? ec_raw : "sub,email";
+        strncpy(extra_claims, src, sizeof(extra_claims) - 1);
+        extra_claims[sizeof(extra_claims) - 1] = '\0';
+    }
+
+    {
+        const char *mjl_raw = GetConfigOptionByName("pg_jwt_role.max_jwt_len", NULL, false);
+        max_jwt_len = (mjl_raw != NULL) ? atoi(mjl_raw) : 0;
+        if (max_jwt_len <= 0)
+            max_jwt_len = 8192;
+    }
+    {
+        const char *mcl_raw = GetConfigOptionByName("pg_jwt_role.max_claim_len", NULL, false);
+        max_claim_len = (mcl_raw != NULL) ? atoi(mcl_raw) : 0;
+        if (max_claim_len <= 0)
+            max_claim_len = 256;
+    }
+
+    /* Defensive upper-bound check on signing_input. */
+    if (signing_input_len > max_jwt_len)
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                 errmsg("pg_jwt_role: signing_input exceeds max_jwt_len")));
+
+    /* ----- 3. Decode signature from base64url. */
+    for (i = 0; i < sig_b64_len; i++)
+    {
+        if (sig_b64[i] == '-')
+            sig_b64[i] = '+';
+        else if (sig_b64[i] == '_')
+            sig_b64[i] = '/';
+    }
+    sig_bytes_len = pg_base64_decode(sig_b64, sig_b64_len,
+                                     sig_bytes, (int)sizeof(sig_bytes));
+    if (sig_bytes_len < 0)
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                 errmsg("pg_jwt_role: malformed signature_b64")));
+
+    /* ----- 4. OpenSSL signature verify (HS / RS / ES family). */
+    if (!pg_jwt_verify(alg_buf,
+                       signing_input_ptr, signing_input_len,
+                       sig_bytes, sig_bytes_len,
+                       verify_key, verify_key_len))
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
+                 errmsg("pg_jwt_role: JWT signature verification failed")));
+
+    /* ----- 5. Copy payload into NUL-terminated stack buffer. */
+    memcpy(payload_buf, payload_ptr, payload_len);
+    payload_buf[payload_len] = '\0';
+
+    /* ----- 6. exp check (numeric claim). Missing exp is tolerated. */
+    if (pg_json_extract_value(payload_buf, "exp", exp_str, sizeof(exp_str)))
+    {
+        char *endp = NULL;
+        long long parsed = strtoll(exp_str, &endp, 10);
+        if (endp != exp_str && *endp == '\0')
+        {
+            exp_val = (time_t)parsed;
+            now = time(NULL);
+            if (now >= exp_val)
+                ereport(ERROR,
+                        (errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
+                         errmsg("pg_jwt_role: JWT expired")));
+        }
+    }
+
+    /* ----- 7. Extract role claim, resolve role OID. */
+    if (!pg_json_extract_value(payload_buf, role_claim,
+                               role_name, (int)sizeof(role_name)))
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
+                 errmsg("pg_jwt_role: JWT missing \"%s\" claim", role_claim)));
+    if ((int)strlen(role_name) > max_claim_len)
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                 errmsg("pg_jwt_role: role claim value exceeds max_claim_len")));
+
+    role_oid = get_role_oid(role_name, true);
+    if (!OidIsValid(role_oid))
+        ereport(ERROR,
+                (errcode(ERRCODE_UNDEFINED_OBJECT),
+                 errmsg("pg_jwt_role: role \"%s\" does not exist", role_name)));
+
+    /* ----- 8. Parse extra_claims CSV and extract each value. */
+    n_extra = pg_split_csv(extra_claims, claim_names, PG_JWT_MAX_CLAIMS);
+    for (i = 0; i < n_extra; i++)
+    {
+        if (!pg_json_extract_value(payload_buf, claim_names[i],
+                                   claim_vals[i],
+                                   (int)sizeof(claim_vals[i])))
+            claim_vals[i][0] = '\0';
+    }
+
+    /* ----- 9. ATOMIC ROLE SWITCH. Caller's privileges are in effect
+     * here; the JWT's signature has already authorised the switch. */
+    SetCurrentRoleId(role_oid);
+
+    /* ----- 10/11. GUC writes under temporary superuser elevation. */
+    GetUserIdAndSecContext(&save_userid, &save_sec);
+    SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, SECURITY_SUPERUSER);
+
+    set_config_option("pg_jwt_role.role", role_name,
+                      PGC_SUSET, PGC_S_SESSION,
+                      GUC_ACTION_LOCAL, true, 0, false);
+
+    for (i = 0; i < n_extra; i++)
+    {
+        int slot;
+
+        if (claim_vals[i][0] == '\0')
+            continue;
+
+        slot = pg_jwt_claim_slot(claim_names[i]);
+        if (slot < 0)
+            continue; /* pool exhausted - drop silently */
+
+        if (!pg_jwt_claim_slot_guc_name(slot, slot_guc, sizeof(slot_guc)))
+            continue;
+
+        set_config_option(slot_guc, claim_vals[i],
+                          PGC_SUSET, PGC_S_SESSION,
+                          GUC_ACTION_LOCAL, true, 0, false);
+    }
+
+    SetUserIdAndSecContext(save_userid, save_sec);
+
+    /* ----- 12. Return the resolved role name. */
+    PG_RETURN_TEXT_P(cstring_to_text(role_name));
 }
 
 /*
@@ -268,7 +887,6 @@ bool pg_jwt_claim_slot_guc_name(int slot, char *buf, int buflen)
     return true;
 }
 
-
 /*
  * pg_jwt_claim_value - SQL-callable lookup of the value bound to a
  * claim name. The PL/pgSQL function pgjwt.claim(name text) calls this
@@ -283,13 +901,12 @@ bool pg_jwt_claim_slot_guc_name(int slot, char *buf, int buflen)
  */
 PG_FUNCTION_INFO_V1(pg_jwt_claim_value);
 
-Datum
-pg_jwt_claim_value(PG_FUNCTION_ARGS)
+Datum pg_jwt_claim_value(PG_FUNCTION_ARGS)
 {
-    text       *name_arg;
-    char       *name_cstr;
-    int         slot;
-    char        guc_name[32];
+    text *name_arg;
+    char *name_cstr;
+    int slot;
+    char guc_name[32];
     const char *value;
 
     if (PG_ARGISNULL(0))
