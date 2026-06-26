@@ -81,11 +81,11 @@ a `pg_jwt_role` schema itself; call sites refer to the functions as
 |------|--------|-------------|-------------|
 | 1 — project skeleton | ✅ done | Makefile, .control, C stub, SQL/PLpgSQL wrapper | — |
 | 2 — GUC registration in `_PG_init` | ✅ done | Config GUCs (PGC_SIGHUP/PGC_SUSET) + `pg_jwt_role.role` + 16 slot GUCs `pg_jwt_role.claim_0`..`claim_15` + slot-binding helpers `pg_jwt_claim_slot`/`pg_jwt_claim_slot_lookup`/`pg_jwt_claim_slot_guc_name` + SQL helper `pgjwt.claim(name)` | — |
-| 3 — atomic C function body | ⏳ todo | C stub always errors | replace [`pg_jwt_verify_and_set_role`](pg_jwt_role.c:39) with full impl |
-| 4 — `ProcessUtility_hook` | ⏳ todo | — | install hook in `_PG_init`, implement `pg_jwt_role_ProcessUtility` |
-| 5 — PL/pgSQL wrapper | ✅ done (Step 1, schema renamed in harness) | — | only edits if Step 3 changes C signature |
+| 3 — atomic C function body | ✅ done | Full impl of [`pg_jwt_verify_and_set_role`](pg_jwt_role.c:537) in [`pg_jwt_role.c`](pg_jwt_role.c:1): HS256/384/512 + RS*/ES* dispatch, constant-time `CRYPTO_memcmp` HMAC, `pg_jwt_verify` algorithm table, hand-rolled `pg_json_extract_value` JSON scanner, `exp` check, `SetCurrentRoleId` + GUC writes under temporary superuser elevation via `SetUserIdAndSecContext` | — |
+| 4 — `ProcessUtility_hook` | ✅ done | Installed in `_PG_init`, implemented as [`pg_jwt_role_ProcessUtility`](pg_jwt_role.c:1050) in [`pg_jwt_role.c`](pg_jwt_role.c:1). Restricts `SET ROLE <other>` for session_users in `pg_jwt_role.restricted_session_users`; allows `SET ROLE <claimed>`, `SET ROLE NONE`, `RESET ROLE`. Keyed off `session_user`, not `current_user` | — |
+| 5 — PL/pgSQL wrapper | ✅ done (landed) | [`pgjwt.set_role`](pg_jwt_role--1.0.sql:87) in [`pg_jwt_role--1.0.sql`](pg_jwt_role--1.0.sql:1): splits by `.`, base64url → base64 + `=` padding for the PG-strict decoder, decodes header for `alg`, delegates everything trust-requiring to the atomic C function. Schema is `pgjwt` per extension-control; see [`pg_jwt_role--1.0.sql`](pg_jwt_role--1.0.sql) header comment for the schema-name deviation from plan §6 | — |
 | 6 — Dockerfile + compose | ✅ done | Multi-stage Alpine + PG 18 build, host UID mapping | — |
-| 7 — tests | ✅ done (smoke level) | [`test_basic`](test/sql/test_basic.sql), [`test_invalid`](test/sql/test_invalid.sql), [`test_hook`](test/sql/test_hook.sql) + [`test_jwt_helper.py`](test/test_jwt_helper.py) | expand to `pg_regress` once Steps 3/4 land |
+| 7 — tests | ✅ done | [`test_basic`](test/sql/test_basic.sql), [`test_invalid`](test/sql/test_invalid.sql), [`test_hook`](test/sql/test_hook.sql), [`test_algorithms`](test/sql/test_algorithms.sql), [`test_exp`](test/sql/test_exp.sql), [`test_limits`](test/sql/test_limits.sql), [`test_unknown`](test/sql/test_unknown.sql) + [`test_jwt_helper.py`](test/test_jwt_helper.py). Run with `scripts/test.sh --implemented` to exercise the full Steps 3/4/5 impl; default mode asserts the stub's "not yet implemented" behaviour | optional: convert to `pg_regress` for a proper expected-output workflow |
 | 8 — README | ⏳ todo | — | install / config / security model docs |
 
 ## Running the tests

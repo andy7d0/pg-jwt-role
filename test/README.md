@@ -60,16 +60,17 @@ without juggling temp files from inside psql.
 
 ## Stub vs implemented mode
 
-The C function [`pg_jwt_verify_and_set_role`](../pg_jwt_role.c:1) is a
-stub until Step 3 of [`plans/plan.md`](../plans/plan.md:643) lands. While
-the stub is in place, every call to `set_role()` raises
-*"pg_jwt_role: verify_and_set_role is not yet implemented"*. The harness
-treats that as a passing outcome for any test that exercises invalid
-inputs (basic, invalid, algorithms, exp, limits, unknown) and skips the
-hook assertion in `test_hook`.
-
-Set `PG_JWT_ROLE_IMPLEMENTED=1` (in [`docker-compose.yml`](../docker-compose.yml:1))
-once Steps 3 and 4 are merged to switch to the real assertions.
+Steps 3 (`pg_jwt_verify_and_set_role` in C), 4 (the `ProcessUtility_hook`),
+and 5 (the PL/pgSQL `set_role` wrapper in
+[`pg_jwt_role--1.0.sql`](../pg_jwt_role--1.0.sql:1)) are all landed in
+[`pg_jwt_role.c`](../pg_jwt_role.c:1) and [`pg_jwt_role--1.0.sql`](../pg_jwt_role--1.0.sql:1).
+The default run is therefore the **implemented** path: every call to
+`set_role()` is expected to produce the success-path behaviour described
+above. The harness env var `PG_JWT_ROLE_IMPLEMENTED=1` (already the
+default in [`scripts/test.sh`](../scripts/test.sh:1)) selects the
+real-impl assertions; `PG_JWT_ROLE_IMPLEMENTED=0` reverts to the legacy
+"stub-mode" expectations for the few negative tests that rely on the
+stub's blanket error.
 
 ### What is *not* covered yet
 

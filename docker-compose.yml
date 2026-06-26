@@ -28,10 +28,12 @@ services:
     # gymnastics inside the container.
     user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
     environment:
-      # Flip to 1 once Step 3 (verify_and_set_role) and Step 4
-      # (ProcessUtility_hook) of plans/plan.md are implemented.
-      # The test scripts gate the success-path expectations on this.
-      PG_JWT_ROLE_IMPLEMENTED: "${PG_JWT_ROLE_IMPLEMENTED:-0}"
+      # Steps 3 (verify_and_set_role), 4 (ProcessUtility_hook), and 5
+      # (PL/pgSQL set_role wrapper) of plans/plan.md are all landed —
+      # the success-path assertions in the test scripts are now the
+      # default. Override with 0 only when reproducing the legacy
+      # stub-mode expectations.
+      PG_JWT_ROLE_IMPLEMENTED: "${PG_JWT_ROLE_IMPLEMENTED:-1}"
       HOME: /tmp
     # All scratch space lives on tmpfs; nothing leaks onto the host.
     tmpfs:

@@ -10,29 +10,47 @@
 -- the only deviation, agreed in AGENTS.md and reflected in pg_jwt_role.control.
 
 -- ============================================================================
--- Step 1 (project skeleton) — done: Makefile, .control, C stub, SQL/PLpgSQL
--- wrapper. The C function pgjwt.verify_and_set_role is declared in
--- pg_jwt_role.c and made available via CREATE FUNCTION below.
+-- Step 5 (PL/pgSQL set_role orchestration) — LANDED.
 --
--- Step 2 (GUC registration) — done in _PG_init. This file also declares the
--- read-side helper pgjwt.claim(name text), which wraps the C entry point
+-- This file implements pgjwt.set_role(jwt_token text) in PL/pgSQL. It is
+-- INTENTIONALLY LIMITED to mechanical operations:
+--   * split JWT by '.'
+--   * base64url -> base64 character substitution + '=' padding for the
+--     PG-strict base64 decoder
+--   * decode(..., 'base64') for header + payload
+--   * extract `alg` from the header JSON (used only as an input to the C
+--     function; if the header has been tampered with, the signature check
+--     inside the C function will fail)
+--   * delegate EVERYTHING trust-requiring (signature verify, JSON-parse of
+--     payload, exp check, role extraction, extra-claim GUC writes) to the
+--     single atomic C function pgjwt.verify_and_set_role
+--   * on signature failure inside the C function: ereport(ERROR) with NO
+--     side effects on role / GUC state.
+--
+-- Step 2 (GUC registration) — LANDED in _PG_init. This file also declares
+-- the read-side helper pgjwt.claim(name text), which wraps the C entry point
 -- pg_jwt_claim_value. The C function looks up the per-backend slot bound to
 -- `name` (see pg_jwt_claim_slot_lookup in pg_jwt_role.c) and returns the
 -- current transaction-local value of the matching pg_jwt_role.claim_<N>
 -- GUC, or NULL if no slot is bound.
 --
--- Step 5 (PL/pgSQL set_role orchestration) — done. This file implements the
--- PL/pgSQL function pgjwt.set_role(jwt_token text). It is INTENTIONALLY
--- LIMITED to mechanical operations:
---   * split JWT by '.'
---   * base64url -> base64 character substitution for header + payload
---   * decode(..., 'base64') for header + payload
---   * extract `alg` from the header JSON (used only as an input to the C
---     function; if it has been tampered with, the signature check below
---     will fail).
--- Everything that requires trusting the JWT (JSON-parse of payload, exp
--- check, role extraction, GUC writes) happens inside the atomic C function
--- pgjwt.verify_and_set_role, AFTER OpenSSL signature verification succeeds.
+-- Step 3 (atomic C function) — LANDED in pg_jwt_role.c as
+-- pg_jwt_verify_and_set_role. The signature (alg text, signing_input bytea,
+-- signature_b64 text, payload_decoded bytea) -> text matches this wrapper
+-- 1:1. If you change the C function signature, this wrapper must change in
+-- lock-step — there are no other callers.
+--
+-- Step 4 (ProcessUtility_hook) — LANDED in pg_jwt_role.c. Independent of
+-- this file; the hook intercepts SET ROLE at the utility-statement level
+-- and is invisible to PL/pgSQL orchestration here.
+--
+-- Schema note: the extension installs into the dedicated `pgjwt` schema
+-- (see pg_jwt_role.control). PostgreSQL reserves `pg_` for system catalogs,
+-- so the extension cannot install into a `pg_jwt_role` schema itself.
+-- Call sites therefore refer to the functions as pgjwt.set_role() and
+-- pgjwt.verify_and_set_role(). The plan §6 writes them as
+-- pg_jwt_role.set_role / pg_jwt_role.verify_and_set_role — the schema is
+-- the only deviation, agreed in AGENTS.md.
 -- ============================================================================
 
 -- Single atomic C function: verify + parse + set role + set extra claims.
