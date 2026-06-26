@@ -2,15 +2,8 @@
 --
 -- Run with: psql -f test/sql/test_basic.sql
 --
--- Behaviour depends on whether the atomic C function is implemented:
---   * Stub (IMPLEMENTED=0)         : set_role() raises
---                                    "not yet implemented" and the role
---                                    is NOT switched. SELECT current_user
---                                    therefore stays as the connecting role.
---   * Implemented (IMPLEMENTED=1) : set_role() succeeds, current_user
---                                    becomes the JWT-claimed role, and
---                                    the configured extra claims are
---                                    exposed via pgjwt.claim(name).
+-- set_role() succeeds: current_user becomes the JWT-claimed role, and
+-- the configured extra claims are exposed via pgjwt.claim(name).
 
 \set ON_ERROR_STOP 0
 \set ECHO all
