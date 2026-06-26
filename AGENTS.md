@@ -86,7 +86,7 @@ a `pg_jwt_role` schema itself; call sites refer to the functions as
 | 5 — PL/pgSQL wrapper | ✅ done (landed) | [`pgjwt.set_role`](pg_jwt_role--1.0.sql:87) in [`pg_jwt_role--1.0.sql`](pg_jwt_role--1.0.sql:1): splits by `.`, base64url → base64 + `=` padding for the PG-strict decoder, decodes header for `alg`, delegates everything trust-requiring to the atomic C function. Schema is `pgjwt` per extension-control; see [`pg_jwt_role--1.0.sql`](pg_jwt_role--1.0.sql) header comment for the schema-name deviation from plan §6 | — |
 | 6 — Dockerfile + compose | ✅ done | Multi-stage Alpine + PG 18 build, host UID mapping | — |
 | 7 — tests | ✅ done | [`test_basic`](test/sql/test_basic.sql), [`test_invalid`](test/sql/test_invalid.sql), [`test_hook`](test/sql/test_hook.sql), [`test_algorithms`](test/sql/test_algorithms.sql), [`test_exp`](test/sql/test_exp.sql), [`test_limits`](test/sql/test_limits.sql), [`test_unknown`](test/sql/test_unknown.sql) + [`test_jwt_helper.py`](test/test_jwt_helper.py). Run with `scripts/test.sh --implemented` to exercise the full Steps 3/4/5 impl; default mode asserts the stub's "not yet implemented" behaviour | optional: convert to `pg_regress` for a proper expected-output workflow |
-| 8 — README | ⏳ todo | — | install / config / security model docs |
+| 8 — README | ✅ done | [`README.md`](README.md) at repo root: install, configuration GUCs, usage, security model, API reference, test commands, limitations | — |
 
 ## Running the tests
 
