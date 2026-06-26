@@ -2,7 +2,19 @@
 comment = 'JWT-based role management with SQL-callable signature verification'
 default_version = '1.0'
 module_pathname = '$libdir/pg_jwt_role'
+# Not relocatable: the function names pg_jwt_role.set_role() and
+# pg_jwt_role.verify_and_set_role() are part of the API contract.
 relocatable = false
+# The extension must not be installable by ordinary users — _PG_init
+# registers PGC_SUSET GUCs and (in Step 4) installs a ProcessUtility
+# hook that changes how SET ROLE works.
 trusted = false
 superuser = false
-schema = 'pg_jwt_role'
+# Install the extension's objects into a dedicated 'pgjwt' schema.
+# PostgreSQL reserves the 'pg_' prefix for system catalogs, so the
+# extension cannot install into a 'pg_jwt_role' schema itself. We use
+# 'pgjwt' instead - no leading underscore, no reserved prefix, clearly
+# identifies the owner. Callers can reference the functions via the
+# extension's names (pg_jwt_role.set_role, etc.) which are looked up
+# via the default search_path once 'pgjwt' is added to it.
+schema = 'pgjwt'

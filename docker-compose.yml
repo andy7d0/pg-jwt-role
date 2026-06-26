@@ -1,0 +1,73 @@
+# docker-compose.yml — run the pg_jwt_role build & test harness.
+#
+# Usage:
+#   scripts/test.sh                # build + run the tests
+#   scripts/test.sh --no-build     # run without rebuilding
+#   scripts/test.sh --rebuild      # force a clean rebuild
+#   scripts/test.sh --implemented  # pass PG_JWT_ROLE_IMPLEMENTED=1
+#
+# The wrapper script exports HOST_UID/HOST_GID from your shell so the
+# container builds and runs as you, not as root. You can also invoke
+# `docker compose` directly with those vars exported.
+
+services:
+  test:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      network: host
+      args:
+        HOST_UID: "${HOST_UID:-1000}"
+        HOST_GID: "${HOST_GID:-1000}"
+        HOST_USER: "${HOST_USER:-runner}"
+    image: pg-jwt-role:test
+    network_mode: host
+    # Run the container as the same UID the host has. The image ships
+    # an account for this UID (created at build time via adduser), so
+    # initdb's getpwnam() check succeeds and there are no privilege
+    # gymnastics inside the container.
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    environment:
+      # Flip to 1 once Step 3 (verify_and_set_role) and Step 4
+      # (ProcessUtility_hook) of plans/plan.md are implemented.
+      # The test scripts gate the success-path expectations on this.
+      PG_JWT_ROLE_IMPLEMENTED: "${PG_JWT_ROLE_IMPLEMENTED:-0}"
+      HOME: /tmp
+    # All scratch space lives on tmpfs; nothing leaks onto the host.
+    tmpfs:
+      - /tmp:size=512m
+    stdin_open: true
+    tty: true
+
+  pg:
+    # Optional companion for interactive use:
+    #   docker compose --profile manual run --rm pg psql ...
+    # Auto-loads the extension at startup.
+    image: pg-jwt-role:test
+    build:
+      context: .
+      dockerfile: Dockerfile
+      network: host
+      args:
+        HOST_UID: "${HOST_UID:-1000}"
+        HOST_GID: "${HOST_GID:-1000}"
+        HOST_USER: "${HOST_USER:-runner}"
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    environment:
+      POSTGRES_DB: pg_jwt_role
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      HOME: /var/lib/postgresql
+    command:
+      - "postgres"
+      - "-c"
+      - "shared_preload_libraries=pg_jwt_role"
+    ports:
+      - "5432:5432"
+    profiles:
+      - manual
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+volumes:
+  pgdata:

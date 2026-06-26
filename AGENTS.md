@@ -63,21 +63,44 @@ JWT-claimed role, or if command is SET ROLE NONE / RESET ROLE.
 | [`pg_jwt_role--1.0.sql`](pg_jwt_role--1.0.sql:1) | SQL declarations + PL/pgSQL `set_role` wrapper |
 | [`plans/plan.md`](plans/plan.md:1) | Full architecture, GUC table, C internals, test plan |
 
-Planned but **not yet present**: `pg_jwt_role.h`, `Dockerfile`, `docker-compose.yml`,
-`test/` directory, `README.md`. See [`plans/plan.md` §4](plans/plan.md:198).
+Now present: [`pg_jwt_role.c`](pg_jwt_role.c:1) (with GUCs registered),
+[`Dockerfile`](Dockerfile:1), [`docker-compose.yml`](docker-compose.yml:1),
+[`scripts/test.sh`](scripts/test.sh:1), and the [`test/`](test/) directory
+(SQL smoke tests + Python JWT helper). See [`plans/plan.md` §4](plans/plan.md:198).
+
+The extension installs into a dedicated schema named `pgjwt` (see
+[`pg_jwt_role.control`](pg_jwt_role.control)). PostgreSQL reserves the
+`pg_` prefix for system catalogs, so the extension can't install into
+a `pg_jwt_role` schema itself; call sites refer to the functions as
+`pgjwt.set_role()` and `pgjwt.verify_and_set_role()`.
 
 ## Implementation state
 
 | Step | Status | What's done | What's next |
 |------|--------|-------------|-------------|
 | 1 — project skeleton | ✅ done | Makefile, .control, C stub, SQL/PLpgSQL wrapper | — |
-| 2 — GUC registration in `_PG_init` | ⏳ todo | — | `DefineCustom*Variable` for all GUCs in [`plans/plan.md` §5](plans/plan.md:226) |
+| 2 — GUC registration in `_PG_init` | ✅ done | All GUCs registered with PG 18 `char **` value-addrs | — |
 | 3 — atomic C function body | ⏳ todo | C stub always errors | replace [`pg_jwt_verify_and_set_role`](pg_jwt_role.c:39) with full impl |
 | 4 — `ProcessUtility_hook` | ⏳ todo | — | install hook in `_PG_init`, implement `pg_jwt_role_ProcessUtility` |
-| 5 — PL/pgSQL wrapper | ✅ done (Step 1) | — | only edits if Step 3 changes C signature |
-| 6 — Dockerfile + compose | ⏳ todo | — | multi-stage Alpine PG 18 build |
-| 7 — tests | ⏳ todo | — | `test_basic`, `test_invalid`, `test_hook` + `test_jwt_helper.py` |
+| 5 — PL/pgSQL wrapper | ✅ done (Step 1, schema renamed in harness) | — | only edits if Step 3 changes C signature |
+| 6 — Dockerfile + compose | ✅ done | Multi-stage Alpine + PG 18 build, host UID mapping | — |
+| 7 — tests | ✅ done (smoke level) | [`test_basic`](test/sql/test_basic.sql), [`test_invalid`](test/sql/test_invalid.sql), [`test_hook`](test/sql/test_hook.sql) + [`test_jwt_helper.py`](test/test_jwt_helper.py) | expand to `pg_regress` once Steps 3/4 land |
 | 8 — README | ⏳ todo | — | install / config / security model docs |
+
+## Running the tests
+
+```bash
+scripts/test.sh                # build the image and run the tests
+scripts/test.sh --no-build     # run without rebuilding
+scripts/test.sh --rebuild      # force a clean rebuild
+scripts/test.sh --implemented  # run with PG_JWT_ROLE_IMPLEMENTED=1
+```
+
+The wrapper exports `HOST_UID`/`HOST_GID` from your shell so the
+container builds and runs as you. The image creates a matching user
+account at build time (`adduser -u $HOST_UID -G $HOST_GID`) so
+initdb's `getpwnam()` check succeeds without any `pg_passwd`
+gymnastics inside the container.
 
 ## C implementation rules (Step 3)
 
