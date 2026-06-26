@@ -18,8 +18,13 @@
 \set ECHO all
 
 SHOW pg_jwt_role.restricted_session_users;
+-- These GUCs are PGC_SUSET; only superuser can SET them. Briefly revert
+-- session authorization to the connecting postgres superuser, set the
+-- values, then re-impersonate app_user for the rest of the test.
+RESET SESSION AUTHORIZATION;
 SET pg_jwt_role.role_claim   = 'role';
 SET pg_jwt_role.extra_claims = 'sub,email';
+SET SESSION AUTHORIZATION app_user;
 
 -- Restricted user: SET ROLE NONE — always allowed.
 SET ROLE app_user;

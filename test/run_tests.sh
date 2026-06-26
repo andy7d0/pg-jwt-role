@@ -123,6 +123,9 @@ $$;
 -- 'pg_jwt_role.<name>' names which resolve via the default
 -- search_path, which includes 'public'.
 CREATE EXTENSION pg_jwt_role;
+GRANT USAGE ON SCHEMA pgjwt TO PUBLIC;
+GRANT dba_user TO app_user;
+GRANT target_role TO app_user;
 -- The SIGHUP-context GUCs (verify_key, restricted_session_users) were
 -- already passed to postgres at startup via -c (see PGOPTS). The
 -- SUSET-context GUCs (role_claim, extra_claims) don't need to be
@@ -243,6 +246,7 @@ SELECT set_config('pg_jwt_role.test.exp_missing_jwt', pg_read_file('$TOKENS/exp_
 SELECT set_config('pg_jwt_role.test.b64url_sig_jwt',  pg_read_file('$TOKENS/b64url_sig.jwt'),  false);
 SELECT set_config('pg_jwt_role.test.slots17_jwt',     pg_read_file('$TOKENS/slots17.jwt'),     false);
 SELECT set_config('pg_jwt_role.test.implemented', '$IMPLEMENTED', false);
+SET SESSION AUTHORIZATION app_user;
 EOF
     cat "$header" "$sql_file" > "$WORK/${name}.sql"
 
@@ -262,13 +266,13 @@ EOF
     if [ "$IMPLEMENTED" = "1" ]; then
         case "$name" in
             test_basic)
-                if grep -q ' target_role ' "$log"; then
+                if grep -qE '[ ]target_role( |$)' "$log"; then
                     echo "    [OK] current_user flipped to target_role"
                 else
                     echo "    [FAIL] current_user never became target_role"
                     rc=1
                 fi
-                if grep -q ' alice@example.com ' "$log"; then
+                if grep -qE 'alice@example.com( |$)' "$log"; then
                     echo "    [OK] pg_jwt_role.email populated"
                 else
                     echo "    [FAIL] pg_jwt_role.email missing"

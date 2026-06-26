@@ -152,28 +152,14 @@ static char claim_slot_name[PG_JWT_MAX_CLAIMS][PG_JWT_MAX_CLAIM_NAME_LEN];
  * The pointers stay valid for the lifetime of the backend process
  * because both the pointer and the buffer are static.
  */
-static char cfg_claim_slot_buf[PG_JWT_MAX_CLAIMS][PG_JWT_MAX_CLAIM_NAME_LEN];
-static char *cfg_claim_slot[PG_JWT_MAX_CLAIMS];
-
-/*
- * Backing storage for the resolved-role output GUC and the
- * configuration GUCs registered in _PG_init. Static so PostgreSQL's
- * GUC system can read/write through the pointers for the lifetime of
- * the backend.
- */
-static char cfg_role_buf[PG_JWT_MAX_CLAIM_NAME_LEN] = "";
-static char cfg_verify_key_buf[4096] = "";
-static char cfg_role_claim_buf[PG_JWT_MAX_CLAIM_NAME_LEN] = "";
-static char cfg_extra_claims_buf[256] = "";
-static char cfg_restricted_session_users_buf[1024] = "";
+static char *cfg_claim_slot[PG_JWT_MAX_CLAIMS] = {0};
+static char *cfg_verify_key = NULL;
+static char *cfg_role_claim = NULL;
+static char *cfg_extra_claims = NULL;
+static char *cfg_restricted_session_users = NULL;
+static char *cfg_role = NULL;
 static int cfg_max_jwt_len = 8192;
 static int cfg_max_claim_len = 256;
-
-static char *cfg_verify_key = cfg_verify_key_buf;
-static char *cfg_role_claim = cfg_role_claim_buf;
-static char *cfg_extra_claims = cfg_extra_claims_buf;
-static char *cfg_restricted_session_users = cfg_restricted_session_users_buf;
-static char *cfg_role = cfg_role_buf;
 
 /*
  * pg_base64_decode - decode a standard base64 string (NOT base64url)
@@ -1090,7 +1076,14 @@ pg_jwt_role_ProcessUtility(PlannedStmt *pstmt,
             stmt->kind == VAR_SET_VALUE &&
             stmt->args != NULL)
         {
-            char *target = strVal(linitial(stmt->args));
+            Node *_n = linitial(stmt->args);
+            char *target = NULL;
+            if (IsA(_n, A_Const) && nodeTag(&((A_Const *) _n)->val) == T_String)
+                target = strVal(&((A_Const *) _n)->val);
+            else if (IsA(_n, String))
+                target = strVal(_n);
+            if (target == NULL)
+                return;
 
             if (strcmp(target, "none") != 0)
             {
@@ -1264,9 +1257,7 @@ void _PG_init(void)
          * pointer. cfg_claim_slot[i] stays valid for the lifetime of
          * the backend (static storage) so PostgreSQL can swap the
          * pointer through it whenever the GUC value changes. */
-        cfg_claim_slot_buf[i][0] = '\0';
-        cfg_claim_slot[i] = cfg_claim_slot_buf[i];
-
+        cfg_claim_slot[i] = NULL;
         snprintf(guc_name, sizeof(guc_name), "pg_jwt_role.claim_%d", i);
 
         DefineCustomStringVariable(

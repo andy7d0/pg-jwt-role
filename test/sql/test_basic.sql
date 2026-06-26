@@ -41,8 +41,14 @@ SELECT count(*) AS claim_slot_count
   FROM pg_settings
  WHERE name LIKE 'pg_jwt_role.claim\_%' ESCAPE '\';
 
+-- These GUCs are PGC_SUSET; only superuser can SET them. Briefly revert
+-- session authorization to the connecting postgres superuser, set the
+-- values, then re-impersonate app_user for the rest of the test.
+RESET SESSION AUTHORIZATION;
 SET pg_jwt_role.role_claim   = 'role';
 SET pg_jwt_role.extra_claims = 'sub,email';
+SET SESSION AUTHORIZATION app_user;
+SET SESSION AUTHORIZATION app_user;
 
 -- pgjwt.claim() with an unbound name must return the empty string
 -- (not error) - that's the COALESCE wrapper around pgjwt.claim_value().

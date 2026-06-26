@@ -22,21 +22,28 @@
 \set ECHO all
 
 -- 1. max_jwt_len enforced.
+RESET SESSION AUTHORIZATION;
 SET pg_jwt_role.max_jwt_len = 128;
 BEGIN;
 SELECT pgjwt.set_role(current_setting('pg_jwt_role.test.hs256_jwt'));
 SELECT 'MARKER_AFTER_SMALL_MAX_JWT: ' || current_user AS after_small_max_jwt_marker;
+SET SESSION AUTHORIZATION app_user;
 COMMIT;
+RESET SESSION AUTHORIZATION;
 RESET pg_jwt_role.max_jwt_len;
 
 -- 2. max_claim_len enforced. Role "target_role" has length 11, so the
 -- C function ereports ERROR when max_claim_len < 11.
+SET SESSION AUTHORIZATION app_user;
 SET pg_jwt_role.max_claim_len = 2;
+RESET SESSION AUTHORIZATION;
 BEGIN;
 SELECT pgjwt.set_role(current_setting('pg_jwt_role.test.hs256_jwt'));
 SELECT 'MARKER_AFTER_SMALL_MAX_CLAIM: ' || current_user AS after_small_max_claim_marker;
 COMMIT;
+SET SESSION AUTHORIZATION app_user;
 RESET pg_jwt_role.max_claim_len;
+RESET SESSION AUTHORIZATION;
 
 -- 3. Slot pool overflow. Configure 17 extra claim names; the C function
 -- can only bind 16 slots, so one claim value must be silently dropped.
@@ -51,6 +58,7 @@ SELECT pgjwt.set_role(current_setting('pg_jwt_role.test.slots17_jwt'));
 SELECT 'MARKER_SLOT_FIRST: '    || COALESCE(pgjwt.claim('a1'),  '') AS slot_first,
        'MARKER_SLOT_OVERFLOW: ' || COALESCE(pgjwt.claim('a17'), '') AS slot_overflow;
 COMMIT;
+SET SESSION AUTHORIZATION app_user;
 RESET pg_jwt_role.extra_claims;
 
 -- Whatever happened above, current_user must still be the original role.
