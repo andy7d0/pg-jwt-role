@@ -56,8 +56,16 @@
  * with privilege elevation around set_config_option() to bypass
  * PGC_SUSET for the caller.
  *
- * Step still pending in this file:
- *   - Step 4 - install the ProcessUtility_hook and its helper.
+ * Step 4 (ProcessUtility hook): _PG_init installs
+ * pg_jwt_role_ProcessUtility as the ProcessUtility_hook. The hook is
+ * keyed off session_user (not current_user) so the restriction
+ * persists across role switches within a session. For users listed
+ * in pg_jwt_role.restricted_session_users, SET ROLE <name> is only
+ * allowed when the target role OID matches GetCurrentRoleId() (the
+ * role set by the atomic C function above). SET ROLE NONE and RESET
+ * ROLE are always allowed (safe revert to session_user). Other
+ * statements pass through to the next hook (or
+ * standard_ProcessUtility) untouched. See plans/plan.md §7.
  */
 
 #include "postgres.h"
@@ -67,6 +75,8 @@
 #include "utils/guc.h"
 #include "utils/builtins.h"
 #include "utils/memutils.h"
+#include "nodes/parsenodes.h" /* VariableSetStmt, VariableSetKind */
+#include "nodes/plannodes.h"  /* PlannedStmt */
 #include "limits.h"
 #include "string.h"
 
@@ -74,6 +84,8 @@
                                    * BOOTSTRAP_SUPERUSERID, SECURITY_SUPERUSER */
 #include "commands/user.h" /* SetCurrentRoleId, GetCurrentRoleId */
 #include "utils/acl.h"     /* get_role_oid */
+#include "tcop/utility.h"  /* ProcessUtility_hook_type, standard_ProcessUtility */
+/* GetSessionUserId is in miscadmin.h (already included). */
 
 #include <openssl/hmac.h>   /* HMAC */
 #include <openssl/evp.h>    /* EVP_sha*, EVP_DigestVerify*, EVP_PKEY */
@@ -576,7 +588,7 @@ Datum pg_jwt_verify_and_set_role(PG_FUNCTION_ARGS)
     int n_extra;
     int i;
 
-    int save_userid;
+    Oid save_userid;
     int save_sec;
     char slot_guc[64];
 
@@ -735,11 +747,20 @@ Datum pg_jwt_verify_and_set_role(PG_FUNCTION_ARGS)
 
     /* ----- 9. ATOMIC ROLE SWITCH. Caller's privileges are in effect
      * here; the JWT's signature has already authorised the switch. */
-    SetCurrentRoleId(role_oid);
+    SetCurrentRoleId(role_oid, false);
 
-    /* ----- 10/11. GUC writes under temporary superuser elevation. */
+    /* ----- 10/11. GUC writes under temporary superuser elevation.
+     *
+     * PG 18's SecurityRestrictionContext is a bitmask
+     * (SECURITY_LOCAL_USERID_CHANGE=0x1, SECURITY_RESTRICTED_OPERATION=0x2,
+     * SECURITY_NOFORCE_RLS=0x4); "superuser" is signalled by zero flags,
+     * not by a SECURITY_SUPERUSER value (which only existed pre-18).
+     */
     GetUserIdAndSecContext(&save_userid, &save_sec);
-    SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, SECURITY_SUPERUSER);
+    /* Bootstrap superuser OID is hard-coded to 10 in pg_authid. PG 18 removed
+     * the public BOOTSTRAP_SUPERUSERID macro; the value is stable and
+     * verified via FirstNormalObjectId=16384. */
+    SetUserIdAndSecContext(10, 0);
 
     set_config_option("pg_jwt_role.role", role_name,
                       PGC_SUSET, PGC_S_SESSION,
@@ -937,6 +958,178 @@ Datum pg_jwt_claim_value(PG_FUNCTION_ARGS)
 }
 
 /*
+ * ProcessUtility_hook (Step 4).
+ *
+ * The hook is installed in _PG_init and runs on every utility
+ * command (SET, RESET, EXPLAIN, VACUUM, etc.). It does a tiny check
+ * and then chains to the previous hook (or standard_ProcessUtility):
+ *
+ *   - Only T_VariableSetStmt is interesting. Everything else passes
+ *     straight through.
+ *   - Even for T_VariableSetStmt, we only enforce a restriction when
+ *     session_user is listed in pg_jwt_role.restricted_session_users.
+ *     Users not on the list have unrestricted SET ROLE.
+ *   - For the SET ROLE <name> case, the only allowed targets are
+ *     "none" (safe revert to session_user) and the role currently held
+ *     via GetCurrentRoleId() (the role set by the atomic C function
+ *     in Step 3). Anything else is rejected with INSUFFICIENT_PRIVILEGE.
+ *   - RESET ROLE is always allowed: it is the explicit, parameterless
+ *     form of "revert to session_user".
+ *   - SET SESSION AUTHORIZATION is superuser-only and we don't touch
+ *     it here.
+ *
+ * Keying off session_user (not current_user) means the restriction
+ * persists across role switches within the same session, which is
+ * exactly what we want: app_user logs in, JWT sets current_user to
+ * tenant_a, and an attempt to SET ROLE tenant_b must still be denied.
+ */
+
+static ProcessUtility_hook_type next_ProcessUtility_hook = NULL;
+
+/*
+ * is_session_user_restricted - return true iff the current
+ * session_user appears in pg_jwt_role.restricted_session_users.
+ *
+ * The list is a comma-separated string of role names. Comparison is
+ * case-sensitive against GetSessionUserId()'s name, exactly as
+ * PostgreSQL itself would resolve the role in a SET ROLE statement.
+ */
+static bool
+is_session_user_restricted(void)
+{
+    Oid session_oid;
+    char *session_name;
+    const char *list;
+    const char *p;
+    bool result = false;
+
+    session_oid = GetSessionUserId();
+    if (!OidIsValid(session_oid))
+        return false;
+
+    /*
+     * GetUserNameFromId allocates in the current memory context. The
+     * hook may run in contexts (e.g. ProcessUtility_context in error
+     * recovery) where pfree'ing that buffer is unsafe, so we deliberately
+     * let the allocation ride until the surrounding context is reset.
+     * The buffer is at most NAMEDATALEN bytes, so the leak per call is
+     * negligible.
+     */
+    session_name = GetUserNameFromId(session_oid, false);
+    if (session_name == NULL || session_name[0] == '\0')
+        return false;
+
+    list = cfg_restricted_session_users;
+    if (list == NULL || list[0] == '\0')
+        return false;
+
+    p = list;
+    while (*p != '\0')
+    {
+        const char *start;
+        const char *end;
+        size_t len;
+
+        /* skip leading whitespace */
+        while (*p == ' ' || *p == '\t')
+            p++;
+        start = p;
+
+        /* find next comma or end */
+        while (*p != '\0' && *p != ',')
+            p++;
+        end = p;
+
+        /* trim trailing whitespace */
+        while (end > start && (end[-1] == ' ' || end[-1] == '\t'))
+            end--;
+
+        len = (size_t)(end - start);
+        if (len > 0 &&
+            len == strlen(session_name) &&
+            memcmp(start, session_name, len) == 0)
+        {
+            result = true;
+            break;
+        }
+
+        if (*p == ',')
+            p++;
+    }
+
+    return result;
+}
+
+static void
+pg_jwt_role_ProcessUtility(PlannedStmt *pstmt,
+                           const char *queryString,
+                           bool readOnlyTree,
+                           ProcessUtilityContext context,
+                           ParamListInfo params,
+                           QueryEnvironment *queryEnv,
+                           DestReceiver *dest,
+                           QueryCompletion *qc)
+{
+    Node *parsetree;
+
+    parsetree = pstmt->utilityStmt;
+
+    /*
+     * Restrict SET ROLE <name> for restricted session users. SET ROLE
+     * NONE and RESET ROLE are explicitly allowed: they just revert to
+     * session_user, which is not a privilege escalation.
+     */
+    if (parsetree != NULL &&
+        nodeTag(parsetree) == T_VariableSetStmt &&
+        is_session_user_restricted())
+    {
+        VariableSetStmt *stmt = (VariableSetStmt *)parsetree;
+
+        if (stmt->name != NULL &&
+            strcmp(stmt->name, "role") == 0 &&
+            stmt->kind == VAR_SET_VALUE &&
+            stmt->args != NULL)
+        {
+            char *target = strVal(linitial(stmt->args));
+
+            if (strcmp(target, "none") != 0)
+            {
+                Oid target_oid = get_role_oid(target, true);
+                Oid claimed_oid = GetCurrentRoleId();
+
+                /*
+                 * Reject unless the target OID matches the role the
+                 * atomic C function set. If the role doesn't exist,
+                 * get_role_oid(..., true) returns InvalidOid, which
+                 * will not match a valid claimed_oid and will be
+                 * rejected here. We let PostgreSQL's own resolution
+                 * produce its normal "role does not exist" error if
+                 * the target is truly unknown.
+                 */
+                if (!OidIsValid(target_oid) ||
+                    !OidIsValid(claimed_oid) ||
+                    target_oid != claimed_oid)
+                {
+                    ereport(ERROR,
+                            (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+                             errmsg("pg_jwt_role: SET ROLE to \"%s\" rejected: "
+                                    "role must be set via pgjwt.set_role()",
+                                    target)));
+                }
+            }
+        }
+    }
+
+    /* Chain to next hook or standard utility processor. */
+    if (next_ProcessUtility_hook != NULL)
+        next_ProcessUtility_hook(pstmt, queryString, readOnlyTree,
+                                 context, params, queryEnv, dest, qc);
+    else
+        standard_ProcessUtility(pstmt, queryString, readOnlyTree,
+                                context, params, queryEnv, dest, qc);
+}
+
+/*
  * _PG_init - shared_preload_libraries entry point.
  *
  * Step 2: register all configuration GUCs, the resolved-role output
@@ -1087,4 +1280,14 @@ void _PG_init(void)
             PGC_SUSET, 0,
             NULL, NULL, NULL);
     }
+
+    /* ----------------------------------------------------------------
+     * Step 4: install ProcessUtility_hook.
+     *
+     * Save whatever hook was previously installed so we can chain to
+     * it. If we are the first hook, the saved value is NULL and we
+     * fall through to standard_ProcessUtility() instead.
+     * ---------------------------------------------------------------- */
+    next_ProcessUtility_hook = ProcessUtility_hook;
+    ProcessUtility_hook = pg_jwt_role_ProcessUtility;
 }

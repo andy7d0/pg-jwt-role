@@ -1,24 +1,39 @@
 -- pg_jwt_role extension: SQL and PL/pgSQL definitions
 -- See plans/plan.md for full architecture.
+--
+-- The extension's objects are installed into the dedicated 'pgjwt' schema
+-- (see pg_jwt_role.control). PostgreSQL reserves the 'pg_' prefix for
+-- system catalogs, so the extension cannot install into a 'pg_jwt_role'
+-- schema itself; call sites refer to the functions as pgjwt.set_role()
+-- and pgjwt.verify_and_set_role(). The canonical plan (§6) writes them as
+-- pg_jwt_role.set_role / pg_jwt_role.verify_and_set_role — the schema is
+-- the only deviation, agreed in AGENTS.md and reflected in pg_jwt_role.control.
 
 -- ============================================================================
--- Step 1 (project skeleton): only the PL/pgSQL wrapper is registered here.
--- The C function pg_jwt_role.verify_and_set_role is declared in C file
+-- Step 1 (project skeleton) — done: Makefile, .control, C stub, SQL/PLpgSQL
+-- wrapper. The C function pgjwt.verify_and_set_role is declared in
 -- pg_jwt_role.c and made available via CREATE FUNCTION below.
 --
--- Step 2 also declares the read-side helper pgjwt.claim(name text), which
--- wraps the C entry point pg_jwt_claim_value. The C function looks up the
--- per-backend slot bound to `name` (see pg_jwt_claim_slot_lookup in
--- pg_jwt_role.c) and returns the current transaction-local value of the
--- matching pg_jwt_role.claim_<N> GUC, or NULL if no slot is bound.
+-- Step 2 (GUC registration) — done in _PG_init. This file also declares the
+-- read-side helper pgjwt.claim(name text), which wraps the C entry point
+-- pg_jwt_claim_value. The C function looks up the per-backend slot bound to
+-- `name` (see pg_jwt_claim_slot_lookup in pg_jwt_role.c) and returns the
+-- current transaction-local value of the matching pg_jwt_role.claim_<N>
+-- GUC, or NULL if no slot is bound.
+--
+-- Step 5 (PL/pgSQL set_role orchestration) — done. This file implements the
+-- PL/pgSQL function pgjwt.set_role(jwt_token text). It is INTENTIONALLY
+-- LIMITED to mechanical operations:
+--   * split JWT by '.'
+--   * base64url -> base64 character substitution for header + payload
+--   * decode(..., 'base64') for header + payload
+--   * extract `alg` from the header JSON (used only as an input to the C
+--     function; if it has been tampered with, the signature check below
+--     will fail).
+-- Everything that requires trusting the JWT (JSON-parse of payload, exp
+-- check, role extraction, GUC writes) happens inside the atomic C function
+-- pgjwt.verify_and_set_role, AFTER OpenSSL signature verification succeeds.
 -- ============================================================================
-
--- This stub will be replaced once the C function is implemented.
--- For Step 1, we register a placeholder so the extension loads.
--- The extension's objects are installed in the 'public' schema (see
--- pg_jwt_role.control). The function names are unprefixed so they
--- resolve via the default search_path; callers can refer to them as
--- 'set_role' and 'verify_and_set_role'.
 
 -- Single atomic C function: verify + parse + set role + set extra claims.
 -- This is the ONLY SQL-callable C function that touches SetCurrentRoleId.
@@ -82,8 +97,10 @@ DECLARE
   header_b64    text;
   payload_b64   text;
   alg           text;
+  signing_input bytea;
+  payload_bytes bytea;
 BEGIN
-  -- 1. Split JWT by '.'
+  -- 1. Split JWT by '.'  (mechanical — no trust)
   header_raw    := split_part(jwt_token, '.', 1);
   payload_raw   := split_part(jwt_token, '.', 2);
   signature_b64 := split_part(jwt_token, '.', 3);
@@ -92,8 +109,10 @@ BEGIN
     RAISE EXCEPTION 'pg_jwt_role: malformed JWT (expected three dot-separated parts)';
   END IF;
 
-  -- 2. base64url -> base64 for header (mechanical, no trust)
-  header_b64 := replace(replace(header_raw, '-', '+'), '_', '/');
+  -- 2. base64url -> base64 for header  (mechanical — no trust).
+  -- base64url omits padding; pad to a multiple of 4 for PG's strict decoder.
+  header_b64 := replace(replace(header_raw, '-', '+'), '_', '/')
+             || repeat('=', (4 - length(replace(replace(header_raw, '-', '+'), '_', '/')) % 4) % 4);
 
   -- 3. Extract alg from header (used only as C input; if tampered, sig will fail)
   alg := json_extract_path_text(
@@ -105,19 +124,27 @@ BEGIN
     RAISE EXCEPTION 'pg_jwt_role: JWT header missing "alg"';
   END IF;
 
-  -- 4. base64url -> base64 for payload (mechanical, no trust)
-  payload_b64 := replace(replace(payload_raw, '-', '+'), '_', '/');
+  -- 4. base64url -> base64 for payload  (mechanical — no trust).
+  -- base64url omits padding; PostgreSQL's decode(..., 'base64') is strict
+  -- and rejects un-padded input. Pad to a multiple of 4 with '='.
+  payload_b64 := replace(replace(payload_raw, '-', '+'), '_', '/')
+              || repeat('=', (4 - length(replace(replace(payload_raw, '-', '+'), '_', '/')) % 4) % 4);
+  payload_bytes := decode(payload_b64, 'base64');
 
-  -- 5. Delegate everything atomic to C:
-  --    signature verify -> JSON-parse payload -> extract role_claim
+  -- signing_input is the ASCII base64url(header).base64url(payload) — this is
+  -- what the C function feeds to OpenSSL for the HMAC / DigestVerify call.
+  signing_input := convert_to(header_raw || '.' || payload_raw, 'utf8');
+
+  -- 5. Delegate EVERYTHING atomic to C:
+  --    verify signature -> JSON-parse payload -> extract role_claim
   --    -> check exp -> extract extra_claims -> SetCurrentRoleId
-  --    -> set_config_option GUC_ACTION_LOCAL for each extra claim.
+  --    -> set_config_option for each extra claim GUC_ACTION_LOCAL.
   --    On verification failure, NO side effects occur.
   RETURN pgjwt.verify_and_set_role(
-    alg,
-    convert_to(header_raw || '.' || payload_raw, 'utf8'),
-    signature_b64,
-    decode(payload_b64, 'base64')
+    alg              => alg,
+    signing_input    => signing_input,
+    signature_b64    => signature_b64,
+    payload_decoded  => payload_bytes
   );
 END;
 $$;

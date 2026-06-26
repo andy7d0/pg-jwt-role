@@ -1,0 +1,57 @@
+-- test_limits.sql — defensive bounds enforced by Step 3.
+--
+-- Run with: psql -X -f test/sql/test_limits.sql (after run_tests.sh injected
+-- the limits_* tokens and configured GUCs).
+--
+-- Behaviour once Step 3 is implemented:
+--   * max_jwt_len=128  → valid HS256 token errors out (signing_input > 128)
+--   * max_claim_len=2  → valid HS256 token errors out (role="target_role"
+--                         has length 11 > 2)
+--   * extra_claims lists 17 distinct names; the C function binds 16 and
+--                         silently drops the 17th (verify_and_set_role
+--                         returns success; one expected claim value is
+--                         not visible).
+--
+-- In stub mode every set_role call surfaces an ERROR and we just look for
+-- at least one ERROR per call.
+--
+-- Output convention: each assertion prints a sentinel on a single line
+-- (MARKER_*) so run_tests.sh can grep robustly.
+
+\set ON_ERROR_STOP 0
+\set ECHO all
+
+-- 1. max_jwt_len enforced.
+SET pg_jwt_role.max_jwt_len = 128;
+BEGIN;
+SELECT pgjwt.set_role(current_setting('pg_jwt_role.test.hs256_jwt'));
+SELECT 'MARKER_AFTER_SMALL_MAX_JWT: ' || current_user AS after_small_max_jwt_marker;
+COMMIT;
+RESET pg_jwt_role.max_jwt_len;
+
+-- 2. max_claim_len enforced. Role "target_role" has length 11, so the
+-- C function ereports ERROR when max_claim_len < 11.
+SET pg_jwt_role.max_claim_len = 2;
+BEGIN;
+SELECT pgjwt.set_role(current_setting('pg_jwt_role.test.hs256_jwt'));
+SELECT 'MARKER_AFTER_SMALL_MAX_CLAIM: ' || current_user AS after_small_max_claim_marker;
+COMMIT;
+RESET pg_jwt_role.max_claim_len;
+
+-- 3. Slot pool overflow. Configure 17 extra claim names; the C function
+-- can only bind 16 slots, so one claim value must be silently dropped.
+SET pg_jwt_role.extra_claims =
+    'a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15,a16,a17';
+BEGIN;
+-- The token has those 17 names as claims. Verify all set_role succeeds
+-- (the C function must not error on overflow, by design).
+SELECT pgjwt.set_role(current_setting('pg_jwt_role.test.slots17_jwt'));
+-- Of the 17 names, claim a1 should be present, claim a17 must NOT be
+-- (slot 15 was the last one available).
+SELECT 'MARKER_SLOT_FIRST: '    || COALESCE(pgjwt.claim('a1'),  '') AS slot_first,
+       'MARKER_SLOT_OVERFLOW: ' || COALESCE(pgjwt.claim('a17'), '') AS slot_overflow;
+COMMIT;
+RESET pg_jwt_role.extra_claims;
+
+-- Whatever happened above, current_user must still be the original role.
+SELECT 'MARKER_AFTER_ALL: ' || current_user AS after_all_marker;
