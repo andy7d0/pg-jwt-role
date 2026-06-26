@@ -1,0 +1,162 @@
+# AGENTS.md — Guide for AI Coding Agents
+
+This file gives AI coding agents the minimum context needed to work effectively on
+[`pg_jwt_role`](Makefile). For the full architecture, security model, and step-by-step
+implementation plan, read [`plans/plan.md`](plans/plan.md:1).
+
+## What this project is
+
+[`pg_jwt_role`](pg_jwt_role.c:1) is a PostgreSQL 18 extension that performs
+**JWT-based role switching**. A caller invokes
+[`pg_jwt_role.set_role(jwt_token text)`](pg_jwt_role--1.0.sql:27); if the JWT
+signature verifies against a configured key, the database role is switched to
+whatever role is named in a configurable claim (default `role`), and selected
+extra claims (default `sub,email`) are exposed as transaction-local GUCs.
+
+A `ProcessUtility_hook` blocks `SET ROLE <other>` for restricted session users
+so the JWT path is the only way to elevate.
+
+## The non-negotiable security rule
+
+> **Atomicity boundary.** [`SetCurrentRoleId()`](pg_jwt_role.c:39) is only
+> reachable *after* a successful OpenSSL signature check, and only via the
+> single C function [`pg_jwt_verify_and_set_role`](pg_jwt_role.c:39).
+
+Never add a separate SQL-callable function that touches
+`SetCurrentRoleId` / role state without going through signature verification
+first. The whole security model depends on this single atomic call.
+
+The PL/pgSQL layer ([`set_role`](pg_jwt_role--1.0.sql:27)) is intentionally
+limited to *mechanical* operations: `split_part`, base64url→base64 character
+substitution, `decode(..., 'base64')`, and header `alg` extraction. Anything
+that requires trusting the JWT (JSON-parse of payload, `exp` check, role
+extraction, GUC writes) happens **inside** the C function, after `HMAC` /
+`EVP_DigestVerify` returns success.
+
+## Architecture at a glance
+
+```
+PL/pgSQL set_role(text)              C verify_and_set_role(...) → text
+───────────────────────              ────────────────────────────────────
+split_part(token, '.', 1/2/3)   →    OpenSSL verify (HS* / RS* / ES*)
+replace('-','+') '_','/'             ├─ FAIL → ereport(ERROR), no side effects
+decode(..., 'base64')                └─ OK   → JSON-scan payload
+extract 'alg' from header                ├─ extract role_claim → SetCurrentRoleId
+delegate to C function                    ├─ check exp vs time(NULL)
+                                         └─ for each extra_claim:
+                                            set_config_option(GUC_ACTION_LOCAL)
+
+ProcessUtility_hook (separate)
+──────────────────────────────
+Intercepts SET ROLE for session_users listed in
+pg_jwt_role.restricted_session_users. Allowed only if target ==
+JWT-claimed role, or if command is SET ROLE NONE / RESET ROLE.
+```
+
+## Repo layout
+
+| File | Purpose |
+|------|---------|
+| [`Makefile`](Makefile:1) | PGXS build, links `-lssl -lcrypto`, C11 |
+| [`pg_jwt_role.control`](pg_jwt_role.control) | Extension metadata (default_version `1.0`) |
+| [`pg_jwt_role.c`](pg_jwt_role.c:1) | Single C entry point `_PG_init` + `pg_jwt_verify_and_set_role` |
+| [`pg_jwt_role--1.0.sql`](pg_jwt_role--1.0.sql:1) | SQL declarations + PL/pgSQL `set_role` wrapper |
+| [`plans/plan.md`](plans/plan.md:1) | Full architecture, GUC table, C internals, test plan |
+
+Planned but **not yet present**: `pg_jwt_role.h`, `Dockerfile`, `docker-compose.yml`,
+`test/` directory, `README.md`. See [`plans/plan.md` §4](plans/plan.md:198).
+
+## Implementation state
+
+| Step | Status | What's done | What's next |
+|------|--------|-------------|-------------|
+| 1 — project skeleton | ✅ done | Makefile, .control, C stub, SQL/PLpgSQL wrapper | — |
+| 2 — GUC registration in `_PG_init` | ⏳ todo | — | `DefineCustom*Variable` for all GUCs in [`plans/plan.md` §5](plans/plan.md:226) |
+| 3 — atomic C function body | ⏳ todo | C stub always errors | replace [`pg_jwt_verify_and_set_role`](pg_jwt_role.c:39) with full impl |
+| 4 — `ProcessUtility_hook` | ⏳ todo | — | install hook in `_PG_init`, implement `pg_jwt_role_ProcessUtility` |
+| 5 — PL/pgSQL wrapper | ✅ done (Step 1) | — | only edits if Step 3 changes C signature |
+| 6 — Dockerfile + compose | ⏳ todo | — | multi-stage Alpine PG 18 build |
+| 7 — tests | ⏳ todo | — | `test_basic`, `test_invalid`, `test_hook` + `test_jwt_helper.py` |
+| 8 — README | ⏳ todo | — | install / config / security model docs |
+
+## C implementation rules (Step 3)
+
+These are hard constraints from [`plans/plan.md` §8](plans/plan.md:408):
+
+- **No `palloc`, no `malloc`.** Use only fixed-size stack buffers.
+  Reference sizes from the plan: alg 16, sig 512, key 4096, payload 1024,
+  claim values 256 each × 16.
+- **Constant-time signature compare.** Use `CRYPTO_memcmp` for HMAC.
+- **Algorithm dispatch** based on the `alg` arg passed from PL/pgSQL:
+  - `HS256/384/512` → `HMAC(EVP_sha*, ...)`
+  - `RS256/384/512` → `EVP_DigestVerify*` with PEM RSA key from `verify_key`
+  - `ES256/384/512` → `EVP_DigestVerify*` with PEM EC key from `verify_key`
+- **JSON parsing** is a hand-rolled linear scan with `strstr` — no full parser
+  needed (see [`pg_json_extract_value`](plans/plan.md:429)).
+- **Privilege elevation for GUC writes.** Output GUCs are registered
+  `PGC_SUSET`, so non-superusers can't `set_config()` them directly. Inside
+  the C function, after signature passes, wrap `set_config_option` calls in:
+  ```c
+  GetUserIdAndSecContext(&save_uid, &save_sec);
+  SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, SECURITY_SUPERUSER);
+  /* ... set_config_option(...) for each extra claim ... */
+  SetUserIdAndSecContext(save_uid, save_sec);
+  ```
+  See [`plans/plan.md` §9](plans/plan.md:500).
+
+## ProcessUtility hook rules (Step 4)
+
+- Restriction is keyed off **`session_user`**, not `current_user` — so the
+  restriction persists across role switches inside the session.
+- Allow `SET ROLE <claimed_role>` (matches `GetCurrentRoleId()`), `SET ROLE NONE`,
+  and `RESET ROLE`. Block everything else for restricted session users.
+- Chain to `next_ProcessUtility_hook` (or
+  `standard_ProcessUtility`) at the end.
+- `SET SESSION AUTHORIZATION` is superuser-only — do not intercept.
+- See [`plans/plan.md` §7](plans/plan.md:322) for the canonical implementation.
+
+## Build / test commands
+
+The extension builds with standard PGXS:
+
+```bash
+make            # builds pg_jwt_role.so
+make install    # installs into $(pg_config --pkglibdir) and $(pg_config --sharedir)
+```
+
+To load it, add to `postgresql.conf`:
+
+```
+shared_preload_libraries = 'pg_jwt_role'
+```
+
+then in SQL:
+
+```sql
+CREATE EXTENSION pg_jwt_role;
+```
+
+Tests are not yet wired up — when implementing Step 7, follow the
+`pg_regress`-style layout shown in [`plans/plan.md` §4](plans/plan.md:198) and
+the cases in [`plans/plan.md` §11](plans/plan.md:611).
+
+## Style conventions
+
+- **C**: C11, `-Wall -Wno-unused-parameter` (from [`Makefile`](Makefile:18)).
+  Match the existing comment style in [`pg_jwt_role.c`](pg_jwt_role.c:1).
+- **SQL/PLpgSQL**: `SET search_path = pg_catalog` on every function; `STRICT`
+  on the C function; `VOLATILE` everywhere (role switch is volatile by nature).
+- **Naming**: `pg_jwt_*` prefix for C internal helpers, `pg_jwt_role.*` for
+  GUCs, `pg_jwt_role.*` for SQL functions.
+- **Comments**: file-header comment on `pg_jwt_role.c` should mention which
+  plan step is current — keep it in sync as steps land.
+
+## When you're unsure
+
+1. Re-read [`plans/plan.md`](plans/plan.md:1). It is the source of truth.
+2. The security model has exactly two layers — **atomic C function** and
+   **ProcessUtility hook**. Anything you add should fit into one of them or
+   be clearly outside the trust boundary (e.g., the PL/pgSQL wrapper).
+3. If a change seems to require a new SQL-callable path to
+   `SetCurrentRoleId`, **stop and reconsider** — the atomicity rule is the
+   whole point.
