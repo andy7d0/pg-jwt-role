@@ -213,6 +213,14 @@ emit_jwt slots17 3600 target_role \
     --a9=v9 --a10=v10 --a11=v11 --a12=v12 --a13=v13 --a14=v14 --a15=v15 \
     --a16=v16 --a17=v17
 
+# Token carrying a JSON claim key that is 65 characters long, one past
+# PG_JWT_MAX_CLAIM_NAME_LEN - 1 = 63. The token is validly signed; the
+# rejection is driven by extra_claims being configured to that long key
+# in test_limits.sql. Exercises the P2.5 follow-up: pg_split_csv() must
+# ereport() instead of silently truncating.
+LONG_CLAIM="$(python3 -c 'print("a" * 65)')"
+emit_jwt long_claim 3600 target_role --sub=alice "--${LONG_CLAIM}=x"
+
 # --- Run each test_*.sql ----------------------------------------------
 PASS=0
 FAIL=0
@@ -245,6 +253,7 @@ SELECT set_config('pg_jwt_role.test.exp_future_jwt',  pg_read_file('$TOKENS/exp_
 SELECT set_config('pg_jwt_role.test.exp_missing_jwt', pg_read_file('$TOKENS/exp_missing.jwt'), false);
 SELECT set_config('pg_jwt_role.test.b64url_sig_jwt',  pg_read_file('$TOKENS/b64url_sig.jwt'),  false);
 SELECT set_config('pg_jwt_role.test.slots17_jwt',     pg_read_file('$TOKENS/slots17.jwt'),     false);
+SELECT set_config('pg_jwt_role.test.long_claim_jwt',  pg_read_file('$TOKENS/long_claim.jwt'),  false);
 SELECT set_config('pg_jwt_role.test.implemented', '$IMPLEMENTED', false);
 EOF
     cat "$header" "$sql_file" > "$WORK/${name}.sql"
@@ -411,6 +420,32 @@ EOF
                     echo "    [FAIL] slot pool overflow not handled as expected"
                     echo "      --- relevant log lines ---"
                     grep -E 'MARKER_SLOT_' "$log" | sed 's/^/      /'
+                    rc=1
+                fi
+                # P2.5 follow-up (plans/coverage.md §P2.5): an extra_claims
+                # entry longer than PG_JWT_MAX_CLAIM_NAME_LEN - 1 must be
+                # hard-rejected by pg_split_csv(), not silently truncated.
+                # The token is validly signed; the rejection is driven by
+                # extra_claims being configured to a 65-character name. The
+                # role switch must NOT happen (MARKER_AFTER_LONG_CLAIM must
+                # NOT be target_role).
+                # P2.5 follow-up (plans/coverage.md §P2.5): an extra_claims
+                # entry longer than PG_JWT_MAX_CLAIM_NAME_LEN - 1 must be
+                # hard-rejected by pg_split_csv(), not silently truncated.
+                # The token is validly signed; the rejection is driven by
+                # extra_claims being configured to a 65-character name. The
+                # role switch must NOT happen (MARKER_AFTER_LONG_CLAIM must
+                # NOT be target_role).
+                if grep -qE ' ERROR:.*(extra_claims entry too long)' "$log"; then
+                    echo "    [OK] over-long extra_claims name rejected (pg_split_csv ereport)"
+                else
+                    echo "    [FAIL] over-long extra_claims name was NOT rejected"
+                    rc=1
+                fi
+                if grep -qE 'MARKER_AFTER_LONG_CLAIM: (postgres|app_user)' "$log"; then
+                    echo "    [OK] role unchanged after over-long extra_claims rejection"
+                else
+                    echo "    [FAIL] role state unclear after over-long extra_claims rejection"
                     rc=1
                 fi
                 ;;

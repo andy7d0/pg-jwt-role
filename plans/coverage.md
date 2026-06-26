@@ -41,6 +41,7 @@ grep-based, not `pg_regress`; assertions live in
 | `ProcessUtility_hook` allows `RESET ROLE` for restricted `session_user` | [`test_hook.sql:2`](../test/sql/test_hook.sql:2) | [`run_tests.sh:315`](../test/run_tests.sh:315) |
 | `ProcessUtility_hook` allows `SET ROLE <claimed>` after `pgjwt.set_role()` | [`test_hook.sql:4`](../test/sql/test_hook.sql:4) | [`run_tests.sh:323`](../test/run_tests.sh:323) |
 | `ProcessUtility_hook` does NOT restrict unmonitored `session_user` | [`test_hook.sql:3`](../test/sql/test_hook.sql:3) | [`run_tests.sh:317`](../test/run_tests.sh:317) |
+| Over-long `extra_claims` name (≥ 64 chars) hard-rejected, role unchanged (P2.5) | [`test_limits.sql:67`](../test/sql/test_limits.sql:67) | [`run_tests.sh:425`](../test/run_tests.sh:425) |
 
 ## Follow-ups, prioritised
 
@@ -76,10 +77,18 @@ and the corresponding greps in [`test/run_tests.sh`](../test/run_tests.sh:292).
 
 ### P2 — Internal C-helper coverage
 
-5. **Reject over-long claim names in [`pg_jwt_claim_slot`](../pg_jwt_role.c:817).**
-   The function returns `-1` when `name` ≥ `PG_JWT_MAX_CLAIM_NAME_LEN`,
-   but no test mints a JWT with a 65+ char claim name. The C function
-   must ereport() in that case; verify it does.
+5. **Reject over-long claim names in [`pg_jwt_claim_slot`](../pg_jwt_role.c:817).** ✅
+   [`pg_split_csv`](../pg_jwt_role.c:328) now ereports
+   `ERRCODE_INVALID_PARAMETER_VALUE` ("extra_claims entry too long")
+   when an `extra_claims` entry is `≥ PG_JWT_MAX_CLAIM_NAME_LEN` bytes,
+   instead of silently truncating. The error fires inside the C
+   function before `SetCurrentRoleId`, so no role state mutates. A new
+   test in [`test/sql/test_limits.sql`](../test/sql/test_limits.sql:67)
+   sets `pg_jwt_role.extra_claims` to a 65-character name, calls
+   `pgjwt.set_role(...)` on a validly-signed token, and asserts both
+   the ERROR and that `current_user` is unchanged
+   (`MARKER_AFTER_LONG_CLAIM`). The harness grep in
+   [`test/run_tests.sh`](../test/run_tests.sh:425) closes the gap.
 6. **Direct invocation of [`pgjwt.claim_value`](../pg_jwt_role--1.0.sql:79).**
    Only the `COALESCE` wrapper [`pgjwt.claim`](../pg_jwt_role--1.0.sql:89)
    is called in tests. The C entry's NULL-on-unbound behaviour is

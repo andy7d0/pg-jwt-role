@@ -316,6 +316,14 @@ pg_json_extract_value(const char *json, const char *key,
  * `names`, one per row. Returns the count copied (>= 0), truncated to
  * `max`. Names are trimmed of leading/trailing ASCII whitespace;
  * empty entries are skipped.
+ *
+ * Names longer than PG_JWT_MAX_CLAIM_NAME_LEN - 1 bytes (including the
+ * NUL) are a hard configuration error. We ereport() instead of
+ * silently truncating, because the configured `extra_claims` GUC and
+ * the actual JSON claim the C function then looks up would silently
+ * disagree — admins would see "my claim was set but its value is
+ * empty" with no explanation. The token is rejected before the
+ * signature is even consulted so the failure is unambiguous.
  */
 static int
 pg_split_csv(const char *csv,
@@ -346,8 +354,18 @@ pg_split_csv(const char *csv,
         len = (int)(end - start);
         if (len > 0)
         {
+            /*
+             * Bound the destination: PG_JWT_MAX_CLAIM_NAME_LEN includes
+             * the NUL, so a user-facing name must be strictly shorter.
+             * Reject rather than truncate so misconfigured extra_claims
+             * can't silently no-op.
+             */
             if (len >= PG_JWT_MAX_CLAIM_NAME_LEN)
-                len = PG_JWT_MAX_CLAIM_NAME_LEN - 1;
+                ereport(ERROR,
+                        (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                         errmsg("pg_jwt_role: extra_claims entry too long "
+                                "(max %d bytes)",
+                                PG_JWT_MAX_CLAIM_NAME_LEN - 1)));
             memcpy(names[n], start, len);
             names[n][len] = '\0';
             n++;
@@ -1078,8 +1096,8 @@ pg_jwt_role_ProcessUtility(PlannedStmt *pstmt,
         {
             Node *_n = linitial(stmt->args);
             char *target = NULL;
-            if (IsA(_n, A_Const) && nodeTag(&((A_Const *) _n)->val) == T_String)
-                target = strVal(&((A_Const *) _n)->val);
+            if (IsA(_n, A_Const) && nodeTag(&((A_Const *)_n)->val) == T_String)
+                target = strVal(&((A_Const *)_n)->val);
             else if (IsA(_n, String))
                 target = strVal(_n);
             if (target == NULL)

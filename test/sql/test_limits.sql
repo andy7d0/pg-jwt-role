@@ -60,6 +60,37 @@ SELECT 'MARKER_SLOT_FIRST: '    || COALESCE(pgjwt.claim('a1'),  '') AS slot_firs
 COMMIT;
 SET SESSION AUTHORIZATION app_user;
 RESET pg_jwt_role.extra_claims;
+-- Drop back to the originally-authenticated user (postgres, the bootstrap
+-- superuser) so the SUSET SET in block #4 is allowed.
+RESET SESSION AUTHORIZATION;
+
+-- 4. Over-long extra_claim name (P2.5 follow-up, plans/coverage.md §P2.5).
+-- The JWT is validly signed and contains a JSON claim whose key is
+-- exactly 65 characters long (one past PG_JWT_MAX_CLAIM_NAME_LEN - 1 = 63).
+-- pg_jwt_role.extra_claims is set to that same long key. pg_split_csv()
+-- must ereport() with ERRCODE_INVALID_PARAMETER_VALUE rather than
+-- silently truncating; current_user must remain the original session role.
+-- This protects the documented "extra_claims" contract — a typo with a
+-- long name can't silently no-op and confuse the admin.
+--
+-- Block #3 above ended with RESET SESSION AUTHORIZATION so su=postgres
+-- and cu=postgres are in effect here, and the SUSET SET below is allowed.
+--
+-- The 65-character literal below is one past PG_JWT_MAX_CLAIM_NAME_LEN
+-- - 1 = 63. We use a literal because PostgreSQL's SET syntax does not
+-- accept function expressions on the RHS of a custom GUC assignment;
+-- only string/numeric literals and `DEFAULT` work.
+SET pg_jwt_role.extra_claims = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+-- SAVEPOINT isolates the set_role call so a rejection doesn't abort the
+-- outer transaction and prevent us from reading current_user afterwards.
+SAVEPOINT before_long;
+SELECT pgjwt.set_role(current_setting('pg_jwt_role.test.long_claim_jwt'));
+ROLLBACK TO SAVEPOINT before_long;
+-- After a rejection we should still be the original role.
+SELECT 'MARKER_AFTER_LONG_CLAIM: ' || current_user AS after_long_claim_marker;
+RELEASE SAVEPOINT before_long;
+RESET pg_jwt_role.extra_claims;
+SET SESSION AUTHORIZATION app_user;
 
 -- Whatever happened above, current_user must still be the original role.
 SELECT 'MARKER_AFTER_ALL: ' || current_user AS after_all_marker;
