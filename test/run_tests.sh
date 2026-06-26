@@ -286,6 +286,20 @@ EOF
                     echo "    [FAIL] pg_jwt_role.email missing"
                     rc=1
                 fi
+                # P2.6 follow-up (plans/coverage.md §P2.6): the C entry
+                # point pgjwt.claim_value() must return NULL (not '', not
+                # an error) when no slot is currently bound to the name.
+                # This is masked by pgjwt.claim()'s COALESCE wrapper, so
+                # the test_basic.sql script calls claim_value() directly
+                # before set_role and emits a sentinel of the form
+                # "MARKER_CLAIM_VALUE_NULL_BEFORE_SET: <bool>". We expect
+                # the boolean to be `true`.
+                if grep -qE 'MARKER_CLAIM_VALUE_NULL_BEFORE_SET: t' "$log"; then
+                    echo "    [OK] pgjwt.claim_value() returns NULL before set_role"
+                else
+                    echo "    [FAIL] pgjwt.claim_value() did not return NULL before set_role"
+                    rc=1
+                fi
                 ;;
             test_invalid)
                 local errs

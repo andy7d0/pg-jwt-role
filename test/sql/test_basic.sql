@@ -47,6 +47,18 @@ SET SESSION AUTHORIZATION app_user;
 SELECT pgjwt.claim('sub')   AS unbound_sub,
        pgjwt.claim('email') AS unbound_email;
 
+-- P2.6 follow-up (plans/coverage.md §P2.6): the C entry point
+-- pgjwt.claim_value() must return NULL (not the empty string, not an
+-- error) when no slot is bound to the requested name. The pgjwt.claim()
+-- helper above COALESCEs that NULL to '' for friendlier SQL use, so the
+-- NULL behaviour is not observable through the helper. Exercise the C
+-- entry point directly and emit a sentinel so the harness can positively
+-- assert it. This is the only place in the suite that calls claim_value()
+-- outside of the wrapper.
+SELECT pgjwt.claim_value('sub') IS NULL AS claim_value_sub_is_null_before_set;
+SELECT 'MARKER_CLAIM_VALUE_NULL_BEFORE_SET: ' ||
+       (pgjwt.claim_value('sub') IS NULL)::text AS claim_value_null_marker;
+
 -- Run set_role inside a transaction so GUC_ACTION_LOCAL cleanup is visible.
 BEGIN;
 SELECT pgjwt.set_role(current_setting('pg_jwt_role.test.valid_jwt'));

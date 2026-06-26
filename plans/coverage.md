@@ -42,6 +42,7 @@ grep-based, not `pg_regress`; assertions live in
 | `ProcessUtility_hook` allows `SET ROLE <claimed>` after `pgjwt.set_role()` | [`test_hook.sql:4`](../test/sql/test_hook.sql:4) | [`run_tests.sh:323`](../test/run_tests.sh:323) |
 | `ProcessUtility_hook` does NOT restrict unmonitored `session_user` | [`test_hook.sql:3`](../test/sql/test_hook.sql:3) | [`run_tests.sh:317`](../test/run_tests.sh:317) |
 | Over-long `extra_claims` name (≥ 64 chars) hard-rejected, role unchanged (P2.5) | [`test_limits.sql:67`](../test/sql/test_limits.sql:67) | [`run_tests.sh:425`](../test/run_tests.sh:425) |
+| Direct `pgjwt.claim_value()` returns NULL on unbound name (P2.6) | [`test_basic.sql:50`](../test/sql/test_basic.sql:50) | [`run_tests.sh:297`](../test/run_tests.sh:297) |
 
 ## Follow-ups, prioritised
 
@@ -89,11 +90,15 @@ and the corresponding greps in [`test/run_tests.sh`](../test/run_tests.sh:292).
    the ERROR and that `current_user` is unchanged
    (`MARKER_AFTER_LONG_CLAIM`). The harness grep in
    [`test/run_tests.sh`](../test/run_tests.sh:425) closes the gap.
-6. **Direct invocation of [`pgjwt.claim_value`](../pg_jwt_role--1.0.sql:79).**
+6. **Direct invocation of [`pgjwt.claim_value`](../pg_jwt_role--1.0.sql:79).** ✅
    Only the `COALESCE` wrapper [`pgjwt.claim`](../pg_jwt_role--1.0.sql:89)
-   is called in tests. The C entry's NULL-on-unbound behaviour is
-   therefore not directly observable. Add a `SELECT pgjwt.claim_value('sub');`
-   call before `set_role` and assert the result is NULL.
+   was being called in tests, so the C entry's NULL-on-unbound behaviour
+   was not directly observable. [`test/sql/test_basic.sql`](../test/sql/test_basic.sql:1)
+   now calls `pgjwt.claim_value('sub')` directly before `set_role`,
+   asserts the boolean `pgjwt.claim_value('sub') IS NULL` is `true`,
+   and emits a `MARKER_CLAIM_VALUE_NULL_BEFORE_SET: <bool>` sentinel.
+   The harness grep at [`test/run_tests.sh`](../test/run_tests.sh:265)
+   closes the gap.
 7. **Tighten error-message regexes.** The current grep patterns in
    [`test/run_tests.sh`](../test/run_tests.sh:265-405) use broad
    alternations — e.g. `(expired|exp)`, `(max_jwt_len|exceeds|too long|signing_input)`,
