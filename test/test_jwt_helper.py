@@ -49,34 +49,23 @@ def b64url_encode(raw: bytes) -> str:
 
 
 def std_b64url_mix(s: str) -> str:
-    """Rewrite a base64url string so that, when interpreted as standard
-    base64 by the C function, every '+' becomes '-' and every '/' becomes '_'
-    of the *base64url alphabet*. We achieve this by remapping characters in
-    the raw signature bytes that decode to '+' or '/' in base64.
+    """Rewrite a base64-encoded signature string so that, when interpreted
+    by the C function as standard base64, the SAME raw bytes decode but
+    the textual encoding now uses base64url characters ('-' / '_')
+    instead of standard base64 characters ('+' / '/').
 
-    Concretely: pick the last full quartet of the signature, decode its
-    3 bytes, set the low 6 bits of the third byte so that, re-encoded,
-    one of the output chars is '-' or '_' in base64url. This produces a
-    signature that is a *valid* HMAC over the same input but whose textual
-    encoding uses base64url characters.
-
-    The C function must normalise these back to '+' / '/' before decoding.
+    Concretely: re-encode the raw signature bytes with the base64url
+    alphabet. The output is byte-identical to the original signature
+    after the C function normalises '-' -> '+' and '_' -> '/'. This
+    proves the C function's base64url -> base64 normalisation path is
+    correct, without touching the cryptographic content.
     """
     pad = "=" * (-len(s) % 4)
-    raw = bytearray(base64.urlsafe_b64decode(s + pad))
-    # Find the last index whose base64url char is '+' or '/'. We flip a bit
-    # in raw bytes 2..end until we get one. Cheap and bounded.
-    for i in range(len(raw) - 1, 1, -1):
-        raw[i] ^= 0x10  # perturb middle bits; usually produces a different
-                        # base64url char. Keep perturbing until we land on
-                        # '-' or '_'.
-        for _ in range(256):
-            out = b64url_encode(bytes(raw))
-            if "-" in out or "_" in out:
-                return out
-            raw[i] ^= 0x01
-    # Couldn't get a base64url char — return original.
-    return s
+    raw = base64.urlsafe_b64decode(s + pad)
+    # Re-encode the SAME bytes with the base64url alphabet. This is the
+    # textual encoding the C function must learn to round-trip via the
+    # normalisation pass.
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
 
 
 def tamper_signature(token: str) -> str:

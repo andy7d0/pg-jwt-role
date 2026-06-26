@@ -4,9 +4,10 @@
 # container.
 #
 # Usage:
-#   scripts/test.sh                # build + run the tests
+#   scripts/test.sh                # build + run the tests (IMPLEMENTED=1)
 #   scripts/test.sh --no-build     # run without rebuilding
 #   scripts/test.sh --rebuild      # force a clean rebuild
+#   scripts/test.sh --stub         # pass PG_JWT_ROLE_IMPLEMENTED=0
 #   scripts/test.sh --implemented  # pass PG_JWT_ROLE_IMPLEMENTED=1
 #
 # Why this wrapper exists:
@@ -23,12 +24,17 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 BUILD_FLAGS=""
-ENV_FLAGS=(PG_JWT_ROLE_IMPLEMENTED=0)
+# Steps 3 & 4 (atomic C function + ProcessUtility hook) have landed in
+# pg_jwt_role.c, so the default run now expects the success-path
+# assertions. The flag is kept for backwards compatibility / future
+# stub-only runs.
+ENV_FLAGS=(PG_JWT_ROLE_IMPLEMENTED=1)
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --no-build)    BUILD_FLAGS="--no-build"; shift ;;
         --rebuild)     BUILD_FLAGS="--build --force-recreate --no-cache"; shift ;;
+        --stub)        ENV_FLAGS=(PG_JWT_ROLE_IMPLEMENTED=0); shift ;;
         --implemented) ENV_FLAGS=(PG_JWT_ROLE_IMPLEMENTED=1); shift ;;
         -h|--help)
             sed -n '2,18p' "$0"
