@@ -36,41 +36,43 @@ grep-based, not `pg_regress`; assertions live in
 | Expired token, missing role claim, unknown role name | [`test_invalid.sql`](../test/sql/test_invalid.sql:1), [`test_unknown.sql`](../test/sql/test_unknown.sql:1) | [`run_tests.sh:378-390`](../test/run_tests.sh:378) |
 | Base64url signature normalisation | [`test_unknown.sql:39`](../test/sql/test_unknown.sql:39) | [`run_tests.sh:392`](../test/run_tests.sh:392) |
 | Malformed/empty/garbage input rejected by PL/pgSQL wrapper | [`test_invalid.sql:26`](../test/sql/test_invalid.sql:26) | [`run_tests.sh:399-404`](../test/run_tests.sh:399) |
-| `ProcessUtility_hook` blocks `SET ROLE <other>` for restricted `session_user` | [`test_hook.sql:59`](../test/sql/test_hook.sql:59) | [`run_tests.sh:293-298`](../test/run_tests.sh:293) |
+| `ProcessUtility_hook` blocks `SET ROLE <other>` for restricted `session_user` | [`test_hook.sql:5`](../test/sql/test_hook.sql:5) | [`run_tests.sh:329`](../test/run_tests.sh:329) |
+| `ProcessUtility_hook` allows `SET ROLE NONE` for restricted `session_user` | [`test_hook.sql:1`](../test/sql/test_hook.sql:1) | [`run_tests.sh:309`](../test/run_tests.sh:309) |
+| `ProcessUtility_hook` allows `RESET ROLE` for restricted `session_user` | [`test_hook.sql:2`](../test/sql/test_hook.sql:2) | [`run_tests.sh:315`](../test/run_tests.sh:315) |
+| `ProcessUtility_hook` allows `SET ROLE <claimed>` after `pgjwt.set_role()` | [`test_hook.sql:4`](../test/sql/test_hook.sql:4) | [`run_tests.sh:323`](../test/run_tests.sh:323) |
+| `ProcessUtility_hook` does NOT restrict unmonitored `session_user` | [`test_hook.sql:3`](../test/sql/test_hook.sql:3) | [`run_tests.sh:317`](../test/run_tests.sh:317) |
 
 ## Follow-ups, prioritised
 
-### P1 — Hook allow-branches are untested (security-critical)
+### P1 — Hook allow-branches are untested (security-critical) — RESOLVED
 
-These are the most material gaps: the hook's three "allowed" code paths
-in [`pg_jwt_role_ProcessUtility`](../pg_jwt_role.c:1049) are exercised
+These were the most material gaps: the hook's three "allowed" code paths
+in [`pg_jwt_role_ProcessUtility`](../pg_jwt_role.c:1049) were exercised
 by the SQL but never positively asserted by the harness. Only the
-rejection branch at [`pg_jwt_role.c:1102`](../pg_jwt_role.c:1102) has a
-grep matching it.
+rejection branch at [`pg_jwt_role.c:1102`](../pg_jwt_role.c:1102) had a
+grep matching it. All four gaps below are now closed by the
+`MARKER_HOOK_*` sentinels in [`test/sql/test_hook.sql`](../test/sql/test_hook.sql:1)
+and the corresponding greps in [`test/run_tests.sh`](../test/run_tests.sh:292).
 
-1. **`SET ROLE <claimed_oid>` succeeds for restricted `session_user`.**
-   [`test/sql/test_hook.sql:48`](../test/sql/test_hook.sql:48) runs
-   `SET ROLE target_role` while `session_user=app_user`, but does **not**
-   first call `pgjwt.set_role()` to populate `pg_jwt_role.role`.
-   Therefore `GetCurrentRoleId()` at [`pg_jwt_role.c:1091`](../pg_jwt_role.c:1091)
-   returns the session OID, `target_oid != claimed_oid`, and the
-   rejection branch fires — the test "passes" via the rejection grep but
-   the *allowed* branch is never actually exercised.
-   Fix: before `SET ROLE target_role`, run `SELECT pgjwt.set_role('...valid_jwt...');`
-   inside the same transaction so `pg_jwt_role.role` is populated, then
-   assert `current_user=target_role` rather than asserting the rejection.
-2. **`SET ROLE NONE` succeeds for restricted `session_user`.** The call
-   runs at [`test/sql/test_hook.sql:30`](../test/sql/test_hook.sql:30)
-   but no grep in [`test/run_tests.sh:293`](../test/run_tests.sh:293)
-   checks the success path. Add an assertion that `current_user`
-   after the call equals `app_user` (the session_user).
-3. **`RESET ROLE` succeeds for restricted `session_user`.** Same shape
-   as #2; runs at [`test/sql/test_hook.sql:36`](../test/sql/test_hook.sql:36).
-4. **Unmonitored `session_user` is unrestricted.** Covered by
-   [`test/sql/test_hook.sql:42`](../test/sql/test_hook.sql:42) but not
-   positively asserted — add a check that
-   `current_user=dba_user` after `SET ROLE dba_user` from an unrestricted
-   session_user.
+1. **`SET ROLE <claimed_oid>` succeeds for restricted `session_user`.** ✅
+   [`test/sql/test_hook.sql:4`](../test/sql/test_hook.sql:4) now runs
+   `SELECT pgjwt.set_role(...)` first, populating `pg_jwt_role.role`
+   *and* switching `current_user` to `target_role` via the atomic C
+   function. The subsequent `SET ROLE target_role` takes the allow
+   branch in `pg_jwt_role_ProcessUtility` (`target_oid == claimed_oid`).
+   The harness asserts this via
+   `MARKER_HOOK_CLAIMED_OK: target_role`.
+2. **`SET ROLE NONE` succeeds for restricted `session_user`.** ✅
+   [`test/sql/test_hook.sql:1`](../test/sql/test_hook.sql:1) now
+   asserts `MARKER_HOOK_NONE_OK: app_user` after the call.
+3. **`RESET ROLE` succeeds for restricted `session_user`.** ✅
+   [`test/sql/test_hook.sql:2`](../test/sql/test_hook.sql:2) now
+   asserts `MARKER_HOOK_RESET_OK: app_user` after the call.
+4. **Unmonitored `session_user` is unrestricted.** ✅
+   [`test/sql/test_hook.sql:3`](../test/sql/test_hook.sql:3) now bounces
+   back to superuser via `RESET SESSION AUTHORIZATION` before
+   `SET SESSION AUTHORIZATION dba_user`, then asserts
+   `MARKER_HOOK_UNMONITORED_OK: dba_user` after `SET ROLE dba_user`.
 
 ### P2 — Internal C-helper coverage
 
@@ -111,10 +113,13 @@ grep matching it.
 
 ## Ordering rationale
 
-P1 is highest because the hook's *allow* branches are part of the
-documented security model in [`AGENTS.md`](../AGENTS.md:1) ("allow
-`SET ROLE <claimed_role>`, `SET ROLE NONE`, `RESET ROLE`") but are
-silently untested. P2 covers internal-helper branches that have less
-external visibility but still represent untested code paths in the C
-file. P3 items are already tracked in `test/README.md` and are larger
-undertakings.
+**P1 is RESOLVED.** The hook's allow branches were the highest priority
+because they are part of the documented security model in
+[`AGENTS.md`](../AGENTS.md:1) ("allow `SET ROLE <claimed_role>`,
+`SET ROLE NONE`, `RESET ROLE`") but were silently untested before this
+round. They are now positively asserted by the `MARKER_HOOK_*` sentinels
+in [`test/sql/test_hook.sql`](../test/sql/test_hook.sql:1) and the
+corresponding greps in [`test/run_tests.sh`](../test/run_tests.sh:292).
+The remaining P2/P3 items have less external visibility (P2: internal
+helper branches in the C file) or are already tracked in
+`test/README.md` and require larger refactors (P3).
