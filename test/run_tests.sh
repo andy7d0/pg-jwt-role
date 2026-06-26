@@ -290,12 +290,53 @@ EOF
                 fi
                 ;;
             test_hook)
+                # P1 follow-up (plans/coverage.md §P1): positively assert
+                # every allow-branch in pg_jwt_role_ProcessUtility, plus
+                # the rejection branch. Each allowed path emits a sentinel
+                # of the form "MARKER_HOOK_<NAME>: <current_user>" via
+                # "SELECT 'MARKER_HOOK_<NAME>: ' || current_user" in
+                # test/sql/test_hook.sql, mirroring the MARKER_HS*
+                # convention used in test_algorithms.sql.
+                #
+                # Marker table (test/sql/test_hook.sql):
+                #   MARKER_HOOK_NONE_OK           = app_user    (SET ROLE NONE)
+                #   MARKER_HOOK_RESET_OK          = app_user    (RESET ROLE)
+                #   MARKER_HOOK_UNMONITORED_OK    = dba_user    (SET ROLE in unrestricted session)
+                #   MARKER_HOOK_CLAIMED_OK        = target_role (SET ROLE <claimed> after pgjwt.set_role)
+                #   The rejection branch raises an ERROR (no
+                #   MARKER_HOOK_REJECTED_PATH sentinel is printed).
+                local hook_rc=0
+                if grep -qE 'MARKER_HOOK_NONE_OK: app_user' "$log"; then
+                    echo "    [OK] hook allowed SET ROLE NONE for restricted user"
+                else
+                    echo "    [FAIL] hook did NOT allow SET ROLE NONE for restricted user"
+                    hook_rc=1
+                fi
+                if grep -qE 'MARKER_HOOK_RESET_OK: app_user' "$log"; then
+                    echo "    [OK] hook allowed RESET ROLE for restricted user"
+                else
+                    echo "    [FAIL] hook did NOT allow RESET ROLE for restricted user"
+                    hook_rc=1
+                fi
+                if grep -qE 'MARKER_HOOK_UNMONITORED_OK: dba_user' "$log"; then
+                    echo "    [OK] hook did not restrict unmonitored session_user"
+                else
+                    echo "    [FAIL] hook restricted unmonitored session_user"
+                    hook_rc=1
+                fi
+                if grep -qE 'MARKER_HOOK_CLAIMED_OK: target_role' "$log"; then
+                    echo "    [OK] hook allowed SET ROLE <claimed> after pgjwt.set_role()"
+                else
+                    echo "    [FAIL] hook did NOT allow SET ROLE <claimed> after pgjwt.set_role()"
+                    hook_rc=1
+                fi
                 if grep -qE 'pg_jwt_role.*SET ROLE.*rejected|ERRCODE_INSUFFICIENT_PRIVILEGE|ERROR.*SET ROLE' "$log"; then
                     echo "    [OK] hook rejected SET ROLE for restricted user"
                 else
                     echo "    [FAIL] hook did not block SET ROLE (Step 4 not implemented?)"
-                    rc=1
+                    hook_rc=1
                 fi
+                rc=$hook_rc
                 ;;
             test_algorithms)
                 # Each happy path prints MARKER_HS{256,384,512}: target_role
