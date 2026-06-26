@@ -11,7 +11,8 @@ implementation plan, read [`plans/plan.md`](plans/plan.md:1).
 [`pg_jwt_role.set_role(jwt_token text)`](pg_jwt_role--1.0.sql:27); if the JWT
 signature verifies against a configured key, the database role is switched to
 whatever role is named in a configurable claim (default `role`), and selected
-extra claims (default `sub,email`) are exposed as transaction-local GUCs.
+extra claims (default `sub,email`) are exposed as transaction-local GUCs
+via the SQL helper `pgjwt.claim(name)`.
 
 A `ProcessUtility_hook` blocks `SET ROLE <other>` for restricted session users
 so the JWT path is the only way to elevate.
@@ -79,7 +80,7 @@ a `pg_jwt_role` schema itself; call sites refer to the functions as
 | Step | Status | What's done | What's next |
 |------|--------|-------------|-------------|
 | 1 — project skeleton | ✅ done | Makefile, .control, C stub, SQL/PLpgSQL wrapper | — |
-| 2 — GUC registration in `_PG_init` | ✅ done | All GUCs registered with PG 18 `char **` value-addrs | — |
+| 2 — GUC registration in `_PG_init` | ✅ done | Config GUCs (PGC_SIGHUP/PGC_SUSET) + `pg_jwt_role.role` + 16 slot GUCs `pg_jwt_role.claim_0`..`claim_15` + slot-binding helpers `pg_jwt_claim_slot`/`pg_jwt_claim_slot_lookup`/`pg_jwt_claim_slot_guc_name` + SQL helper `pgjwt.claim(name)` | — |
 | 3 — atomic C function body | ⏳ todo | C stub always errors | replace [`pg_jwt_verify_and_set_role`](pg_jwt_role.c:39) with full impl |
 | 4 — `ProcessUtility_hook` | ⏳ todo | — | install hook in `_PG_init`, implement `pg_jwt_role_ProcessUtility` |
 | 5 — PL/pgSQL wrapper | ✅ done (Step 1, schema renamed in harness) | — | only edits if Step 3 changes C signature |
@@ -122,10 +123,17 @@ These are hard constraints from [`plans/plan.md` §8](plans/plan.md:408):
   ```c
   GetUserIdAndSecContext(&save_uid, &save_sec);
   SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, SECURITY_SUPERUSER);
-  /* ... set_config_option(...) for each extra claim ... */
+  /* for each extra claim name:
+   *   slot = pg_jwt_claim_slot(name);
+   *   pg_jwt_claim_slot_guc_name(slot, guc_name, sizeof(guc_name));
+   *   set_config_option(guc_name, value, PGC_SUSET, PGC_S_SESSION,
+   *                     GUC_ACTION_LOCAL, true, 0, false);
+   */
   SetUserIdAndSecContext(save_uid, save_sec);
   ```
-  See [`plans/plan.md` §9](plans/plan.md:500).
+  `pg_jwt_claim_slot(name)` lazily binds `name` to a free slot in the
+  per-backend static table (see Step 2 in the table above); existing
+  bindings are reused. See [`plans/plan.md` §9](plans/plan.md:500).
 
 ## ProcessUtility hook rules (Step 4)
 
