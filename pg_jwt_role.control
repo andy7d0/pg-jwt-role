@@ -1,0 +1,8 @@
+# pg_jwt_role extension
+comment = 'JWT-based role management with SQL-callable signature verification'
+default_version = '1.0'
+module_pathname = '$libdir/pg_jwt_role'
+relocatable = false
+trusted = false
+superuser = false
+schema = 'pg_jwt_role'
