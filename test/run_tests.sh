@@ -246,7 +246,6 @@ SELECT set_config('pg_jwt_role.test.exp_missing_jwt', pg_read_file('$TOKENS/exp_
 SELECT set_config('pg_jwt_role.test.b64url_sig_jwt',  pg_read_file('$TOKENS/b64url_sig.jwt'),  false);
 SELECT set_config('pg_jwt_role.test.slots17_jwt',     pg_read_file('$TOKENS/slots17.jwt'),     false);
 SELECT set_config('pg_jwt_role.test.implemented', '$IMPLEMENTED', false);
-SET SESSION AUTHORIZATION app_user;
 EOF
     cat "$header" "$sql_file" > "$WORK/${name}.sql"
 

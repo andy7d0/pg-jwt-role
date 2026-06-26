@@ -48,7 +48,6 @@ RESET SESSION AUTHORIZATION;
 SET pg_jwt_role.role_claim   = 'role';
 SET pg_jwt_role.extra_claims = 'sub,email';
 SET SESSION AUTHORIZATION app_user;
-SET SESSION AUTHORIZATION app_user;
 
 -- pgjwt.claim() with an unbound name must return the empty string
 -- (not error) - that's the COALESCE wrapper around pgjwt.claim_value().
