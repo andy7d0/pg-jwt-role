@@ -62,6 +62,7 @@ COPY Makefile                 ./Makefile
 COPY pg_jwt_role.control      ./pg_jwt_role.control
 COPY pg_jwt_role--1.0.sql     ./pg_jwt_role--1.0.sql
 COPY pg_jwt_role.c            ./pg_jwt_role.c
+COPY pg_jwt_base64.c          ./pg_jwt_base64.c
 COPY plans                    ./plans
 
 # pg_jwt_role.h is planned (see plans/plan.md §4) but not yet present.

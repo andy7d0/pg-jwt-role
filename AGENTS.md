@@ -68,6 +68,7 @@ Keyed off session_user, not current_user.
 | [`Makefile`](Makefile:1) | PGXS build, links `-lssl -lcrypto`, C11 |
 | [`pg_jwt_role.control`](pg_jwt_role.control) | Extension metadata (`default_version 1.0`, `schema pgjwt`, `superuser=false`, `trusted=false`) |
 | [`pg_jwt_role.c`](pg_jwt_role.c:1) | Single C entry point `_PG_init` + `pg_jwt_verify_and_set_role` + `pg_jwt_claim_value` + `pg_jwt_role_ProcessUtility` |
+| [`pg_jwt_base64.c`](pg_jwt_base64.c:1) | `pg_base64_decode` (standard base64) + `pg_base64url_decode` (alphabet substitution + padding + decode). Dependency-free; no OpenSSL or PG headers required beyond `postgres.h`/`string.h`. |
 | [`pg_jwt_role--1.0.sql`](pg_jwt_role--1.0.sql:1) | `pgjwt.verify_and_set_role`, `pgjwt.claim_value`, `pgjwt.claim`, PL/pgSQL `pgjwt.set_role` wrapper |
 | [`Dockerfile`](Dockerfile:1) | Multi-stage Alpine + PG 18 build, host UID mapping |
 | [`docker-compose.yml`](docker-compose.yml:1) | Test runner + optional `pg` companion service |

@@ -104,6 +104,13 @@ extern int pg_jwt_claim_slot(const char *name);
 extern int pg_jwt_claim_slot_lookup(const char *name);
 extern bool pg_jwt_claim_slot_guc_name(int slot, char *buf, int buflen);
 
+/* Base64 / base64url decoders. Defined in pg_jwt_base64.c. */
+extern int pg_base64_decode(const char *src, int srclen,
+                            char *dst, int dstlen);
+extern int pg_base64url_decode(const char *src, int srclen,
+                               char *scratch, int scratchlen,
+                               char *dst, int dstlen);
+
 /*
  * Pool size for the extra-claim GUC slot table. Caps the number of
  * distinct claim names that verify_and_set_role can bind at once.
@@ -160,74 +167,6 @@ static char *cfg_restricted_session_users = NULL;
 static char *cfg_role = NULL;
 static int cfg_max_jwt_len = 8192;
 static int cfg_max_claim_len = 256;
-
-/*
- * pg_base64_decode - decode a standard base64 string (NOT base64url)
- * into a byte buffer. Returns the number of bytes written, or -1 on
- * malformed input or buffer overflow.
- *
- * Accepts the alphabet A-Z a-z 0-9 + /, '=' padding, and embedded
- * whitespace (space, tab, CR, LF). The input is NOT NUL-terminated;
- * srclen is the exact length. The caller must normalise base64url ->
- * standard base64 ('-' -> '+', '_' -> '/') before calling.
- */
-static int
-pg_base64_decode(const char *src, int srclen, char *dst, int dstlen)
-{
-    int quad[4];
-    int qi = 0;
-    int out = 0;
-    int i;
-
-    for (i = 0; i < srclen; i++)
-    {
-        char c = src[i];
-        int v;
-
-        if (c == ' ' || c == '\t' || c == '\n' || c == '\r')
-            continue;
-        if (c == '=')
-            break;
-        if (c >= 'A' && c <= 'Z')
-            v = c - 'A';
-        else if (c >= 'a' && c <= 'z')
-            v = c - 'a' + 26;
-        else if (c >= '0' && c <= '9')
-            v = c - '0' + 52;
-        else if (c == '+')
-            v = 62;
-        else if (c == '/')
-            v = 63;
-        else
-            return -1;
-        quad[qi++] = v;
-        if (qi == 4)
-        {
-            if (out + 3 > dstlen)
-                return -1;
-            dst[out++] = (char)((quad[0] << 2) | (quad[1] >> 4));
-            dst[out++] = (char)((quad[1] << 4) | (quad[2] >> 2));
-            dst[out++] = (char)((quad[2] << 6) | quad[3]);
-            qi = 0;
-        }
-    }
-    if (qi == 1)
-        return -1;
-    if (qi == 2)
-    {
-        if (out + 1 > dstlen)
-            return -1;
-        dst[out++] = (char)((quad[0] << 2) | (quad[1] >> 4));
-    }
-    else if (qi == 3)
-    {
-        if (out + 2 > dstlen)
-            return -1;
-        dst[out++] = (char)((quad[0] << 2) | (quad[1] >> 4));
-        dst[out++] = (char)((quad[1] << 4) | (quad[2] >> 2));
-    }
-    return out;
-}
 
 /*
  * pg_json_extract_value - look up a key in a flat JSON object and
@@ -561,6 +500,11 @@ Datum pg_jwt_verify_and_set_role(PG_FUNCTION_ARGS)
     char alg_buf[PG_JWT_MAX_ALG_LEN];
     int alg_len;
     char sig_b64[PG_JWT_MAX_SIG_BYTES + 4];
+    /* Normalised form of sig_b64 (base64url '-'/'_' -> '+'/'/'), with
+     * '=' padding to a multiple of 4. Filled in by pg_base64url_decode()
+     * in pg_jwt_base64.c. Kept separate from sig_b64 because the decoder
+     * needs to read src while writing the normalised form. */
+    char sig_b64_norm[PG_JWT_MAX_SIG_BYTES + 4];
     int sig_b64_len;
     int signing_input_len;
     const char *signing_input_ptr;
@@ -678,16 +622,12 @@ Datum pg_jwt_verify_and_set_role(PG_FUNCTION_ARGS)
                 (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
                  errmsg("pg_jwt_role: signing_input exceeds max_jwt_len")));
 
-    /* ----- 3. Decode signature from base64url. */
-    for (i = 0; i < sig_b64_len; i++)
-    {
-        if (sig_b64[i] == '-')
-            sig_b64[i] = '+';
-        else if (sig_b64[i] == '_')
-            sig_b64[i] = '/';
-    }
-    sig_bytes_len = pg_base64_decode(sig_b64, sig_b64_len,
-                                     sig_bytes, (int)sizeof(sig_bytes));
+    /* ----- 3. Decode signature from base64url (delegated to
+     * pg_jwt_base64.c; does alphabet substitution + '=' padding +
+     * standard base64 decode in one shot). */
+    sig_bytes_len = pg_base64url_decode(sig_b64, sig_b64_len,
+                                        sig_b64_norm, (int)sizeof(sig_b64_norm),
+                                        sig_bytes, (int)sizeof(sig_bytes));
     if (sig_bytes_len < 0)
         ereport(ERROR,
                 (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
