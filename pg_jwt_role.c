@@ -111,6 +111,10 @@ extern int pg_base64url_decode(const char *src, int srclen,
                                char *scratch, int scratchlen,
                                char *dst, int dstlen);
 
+/* JSON scan and CSV split helpers. Defined in their own .c files. */
+#include "pg_jwt_json.h"
+#include "pg_jwt_csv.h"
+
 /*
  * Pool size for the extra-claim GUC slot table. Caps the number of
  * distinct claim names that verify_and_set_role can bind at once.
@@ -167,154 +171,6 @@ static char *cfg_restricted_session_users = NULL;
 static char *cfg_role = NULL;
 static int cfg_max_jwt_len = 8192;
 static int cfg_max_claim_len = 256;
-
-/*
- * pg_json_extract_value - look up a key in a flat JSON object and
- * copy its scalar value into `out`. Returns true on success, false if
- * the key is not present.
- *
- * Deliberately tiny: searches for `"<key>":` with strstr, then
- * extracts either a quoted string (with simple \\, \" escape handling)
- * or a bare numeric/bool/null literal terminated by ',', '}', or
- * whitespace. NOT a full JSON parser. See plans/plan.md §8.
- */
-static bool
-pg_json_extract_value(const char *json, const char *key,
-                      char *out, int outlen)
-{
-    char pattern[PG_JWT_MAX_CLAIM_NAME_LEN + 8];
-    int key_len;
-    int pattern_len;
-    const char *p;
-    int i;
-
-    if (json == NULL || key == NULL || out == NULL || outlen < 2)
-        return false;
-
-    key_len = (int)strlen(key);
-    if (key_len <= 0 || key_len >= PG_JWT_MAX_CLAIM_NAME_LEN)
-        return false;
-    if (key_len + 4 > (int)sizeof(pattern))
-        return false;
-
-    pattern[0] = '"';
-    memcpy(pattern + 1, key, key_len);
-    pattern[1 + key_len] = '"';
-    pattern[2 + key_len] = ':';
-    pattern_len = 3 + key_len;
-    pattern[pattern_len] = '\0';
-
-    p = strstr(json, pattern);
-    if (p == NULL)
-        return false;
-    p += pattern_len;
-
-    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')
-        p++;
-
-    if (*p == '"')
-    {
-        p++;
-        i = 0;
-        while (*p && *p != '"')
-        {
-            if (*p == '\\' && *(p + 1))
-            {
-                p++;
-                if (i < outlen - 1)
-                    out[i++] = *p;
-                p++;
-            }
-            else
-            {
-                if (i < outlen - 1)
-                    out[i++] = *p;
-                p++;
-            }
-        }
-        out[i] = '\0';
-        return (i > 0);
-    }
-
-    {
-        const char *start = p;
-        while (*p && *p != ',' && *p != '}' &&
-               *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r')
-            p++;
-        i = (int)(p - start);
-        if (i >= outlen)
-            i = outlen - 1;
-        memcpy(out, start, i);
-        out[i] = '\0';
-        return (i > 0);
-    }
-}
-
-/*
- * pg_split_csv - copy the comma-separated names from `csv` into
- * `names`, one per row. Returns the count copied (>= 0), truncated to
- * `max`. Names are trimmed of leading/trailing ASCII whitespace;
- * empty entries are skipped.
- *
- * Names longer than PG_JWT_MAX_CLAIM_NAME_LEN - 1 bytes (including the
- * NUL) are a hard configuration error. We ereport() instead of
- * silently truncating, because the configured `extra_claims` GUC and
- * the actual JSON claim the C function then looks up would silently
- * disagree — admins would see "my claim was set but its value is
- * empty" with no explanation. The token is rejected before the
- * signature is even consulted so the failure is unambiguous.
- */
-static int
-pg_split_csv(const char *csv,
-             char names[][PG_JWT_MAX_CLAIM_NAME_LEN], int max)
-{
-    int n = 0;
-    const char *p;
-
-    if (csv == NULL || max <= 0)
-        return 0;
-
-    p = csv;
-    while (*p && n < max)
-    {
-        const char *start;
-        const char *end;
-        int len;
-
-        while (*p == ' ' || *p == '\t')
-            p++;
-        start = p;
-        while (*p && *p != ',')
-            p++;
-        end = p;
-        while (end > start && (end[-1] == ' ' || end[-1] == '\t'))
-            end--;
-
-        len = (int)(end - start);
-        if (len > 0)
-        {
-            /*
-             * Bound the destination: PG_JWT_MAX_CLAIM_NAME_LEN includes
-             * the NUL, so a user-facing name must be strictly shorter.
-             * Reject rather than truncate so misconfigured extra_claims
-             * can't silently no-op.
-             */
-            if (len >= PG_JWT_MAX_CLAIM_NAME_LEN)
-                ereport(ERROR,
-                        (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-                         errmsg("pg_jwt_role: extra_claims entry too long "
-                                "(max %d bytes)",
-                                PG_JWT_MAX_CLAIM_NAME_LEN - 1)));
-            memcpy(names[n], start, len);
-            names[n][len] = '\0';
-            n++;
-        }
-
-        if (*p == ',')
-            p++;
-    }
-    return n;
-}
 
 /*
  * pg_jwt_verify - dispatch signature verification based on `alg`.
