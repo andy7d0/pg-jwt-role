@@ -67,6 +67,8 @@ COPY pg_jwt_json.c            ./pg_jwt_json.c
 COPY pg_jwt_json.h            ./pg_jwt_json.h
 COPY pg_jwt_csv.c             ./pg_jwt_csv.c
 COPY pg_jwt_csv.h             ./pg_jwt_csv.h
+COPY pg_jwt_strlist.c         ./pg_jwt_strlist.c
+COPY pg_jwt_strlist.h         ./pg_jwt_strlist.h
 COPY plans                    ./plans
 
 # pg_jwt_role.h is planned (see plans/plan.md §4) but not yet present.

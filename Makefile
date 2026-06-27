@@ -2,7 +2,7 @@ EXTENSION = pg_jwt_role
 EXTVERSION = 1.0
 
 MODULE_big = pg_jwt_role
-OBJS = pg_jwt_role.o pg_jwt_base64.o pg_jwt_json.o pg_jwt_csv.o
+OBJS = pg_jwt_role.o pg_jwt_base64.o pg_jwt_json.o pg_jwt_csv.o pg_jwt_strlist.o
 
 DATA = pg_jwt_role--1.0.sql
 PGFILEDESC = "pg_jwt_role - JWT-based role management"

@@ -111,9 +111,10 @@ extern int pg_base64url_decode(const char *src, int srclen,
                                char *scratch, int scratchlen,
                                char *dst, int dstlen);
 
-/* JSON scan and CSV split helpers. Defined in their own .c files. */
+/* JSON scan, CSV split, and string-list helpers. Defined in their own .c files. */
 #include "pg_jwt_json.h"
 #include "pg_jwt_csv.h"
+#include "pg_jwt_strlist.h"
 
 /*
  * Pool size for the extra-claim GUC slot table. Caps the number of
@@ -799,9 +800,6 @@ is_session_user_restricted(void)
 {
     Oid session_oid;
     char *session_name;
-    const char *list;
-    const char *p;
-    bool result = false;
 
     session_oid = GetSessionUserId();
     if (!OidIsValid(session_oid))
@@ -819,45 +817,7 @@ is_session_user_restricted(void)
     if (session_name == NULL || session_name[0] == '\0')
         return false;
 
-    list = cfg_restricted_session_users;
-    if (list == NULL || list[0] == '\0')
-        return false;
-
-    p = list;
-    while (*p != '\0')
-    {
-        const char *start;
-        const char *end;
-        size_t len;
-
-        /* skip leading whitespace */
-        while (*p == ' ' || *p == '\t')
-            p++;
-        start = p;
-
-        /* find next comma or end */
-        while (*p != '\0' && *p != ',')
-            p++;
-        end = p;
-
-        /* trim trailing whitespace */
-        while (end > start && (end[-1] == ' ' || end[-1] == '\t'))
-            end--;
-
-        len = (size_t)(end - start);
-        if (len > 0 &&
-            len == strlen(session_name) &&
-            memcmp(start, session_name, len) == 0)
-        {
-            result = true;
-            break;
-        }
-
-        if (*p == ',')
-            p++;
-    }
-
-    return result;
+    return pg_jwt_strlist_contains(cfg_restricted_session_users, session_name);
 }
 
 static void
