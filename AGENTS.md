@@ -144,6 +144,15 @@ Steps 3/4/5 implementation; `--stub` exists for reproducing the
 historical stub-mode expectations only — it does not match the code
 shipped today and should be considered archival.
 
+### C unit tests (no Docker / no PostgreSQL install)
+
+`test/unit/run_unit_tests.sh` compiles and runs direct unit tests for
+the four extracted pure-logic helpers (`pg_jwt_strlist`, `pg_jwt_json`,
+`pg_jwt_base64`, `pg_jwt_csv`) against the real production `.c` files,
+using minimal stub headers under `test/unit/stubs/` in place of the
+PostgreSQL headers. This closes the "P2 — Internal C-helper coverage"
+gap from `plans/coverage.md`. See `test/README.md` §Unit tests.
+
 ## C implementation rules (Step 3)
 
 These are hard constraints originally from `plans/plan.md` §8 and now baked

@@ -108,6 +108,27 @@ and the corresponding greps in [`test/run_tests.sh`](../test/run_tests.sh:292).
    (`ERRCODE_INSUFFICIENT_PRIVILEGE`, `ERRCODE_INVALID_PARAMETER_VALUE`,
    etc.) and message substrings.
 
+### P2.8 — Direct C unit tests for the extracted helpers — RESOLVED
+
+The four pure-logic helper modules
+([`pg_jwt_strlist.c`](../pg_jwt_strlist.c:1),
+[`pg_jwt_json.c`](../pg_jwt_json.c:1),
+[`pg_jwt_base64.c`](../pg_jwt_base64.c:1),
+[`pg_jwt_csv.c`](../pg_jwt_csv.c:1)) previously had only *indirect*
+coverage via the SQL harness. They now also have direct C unit tests
+under [`test/unit/`](../test/unit/), run by
+[`test/unit/run_unit_tests.sh`](../test/unit/run_unit_tests.sh) with no
+Docker or PostgreSQL install required. The tests link the **real**
+production `.c` files unchanged against minimal stub headers in
+[`test/unit/stubs/`](../test/unit/stubs/) (standing in for the
+PostgreSQL headers those files `#include`). Covered: NULL/range guards,
+whitespace trimming, case sensitivity, base64url `-`/`_`→`+`/`/`
+substitution + auto-padding, JSON prefix-key safety, escape handling,
+truncation, and the `ereport(ERROR)` over-long-name rejection in
+`pg_split_csv` (exercised through a stub `longjmp`). The stub
+`ereport` reproduces PG's non-return contract for ERROR, so the
+security-relevant rejection path runs as production code.
+
 ### P3 — Larger refactors (already tracked in repo)
 
 8. **Asymmetric algorithms (RS256/384/512, ES256/384/512).** The

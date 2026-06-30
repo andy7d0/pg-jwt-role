@@ -83,6 +83,32 @@ stub's blanket error.
   grep-based. Migrating to `pg_regress` would let us assert exact
   output, but that's a larger refactor of `run_tests.sh`.
 
+## Unit tests
+
+The [`test/unit/`](unit/) directory holds C unit tests for the four
+extracted pure-logic helper modules (`pg_jwt_strlist`, `pg_jwt_json`,
+`pg_jwt_base64`, `pg_jwt_csv`). Unlike the SQL harness above, these run
+**without Docker or a PostgreSQL install**: they link the real
+production `.c` files unchanged against minimal stub headers in
+[`test/unit/stubs/`](unit/stubs/) that stand in for the PostgreSQL
+headers those files `#include`.
+
+This closes the "P2 — Internal C-helper coverage" gap from
+[`plans/coverage.md`](../plans/coverage.md:79): each helper previously
+had only indirect coverage via the SQL path; it now has direct tests
+for its NULL guards, trimming, alphabet substitution, truncation, and
+boundary conditions (including the `ereport(ERROR)` over-long-name
+rejection in `pg_split_csv`, exercised through a stub `longjmp`).
+
+```bash
+test/unit/run_unit_tests.sh          # build + run, fail fast
+test/unit/run_unit_tests.sh -k       # keep going across failures
+test/unit/run_unit_tests.sh clean    # remove build artefacts
+```
+
+Requires only a C compiler (`gcc`/`clang` via `$CC`); built artefacts
+land in `test/unit/build/` (gitignored).
+
 ## Running
 
 ```bash
